@@ -1,0 +1,135 @@
+{
+  "camera_serial": "260522271432",
+  "camera_role": "right_wrist",
+  "source_episode": "/home/admin2026/guchenyang/Project/wuji-hand-teleop/.local/episodes_newbadminton2/episode_0252",
+  "recorded_stream": "wrist",
+  "source_frame": "right_wrist_color_optical_native",
+  "target_frame": "TCP_Link_R",
+  "recorded_image_rotation_ccw_deg": 90,
+  "translation_unit": "m",
+  "checkerboard_inner_corners": [
+    8,
+    5
+  ],
+  "square_mm": 25,
+  "square_size_provenance": "assumed same 25 mm checkerboard as head calibration; confirm against actual print",
+  "native_intrinsics": {
+    "width": 640,
+    "height": 480,
+    "fx": 394.1140441894531,
+    "fy": 393.6058349609375,
+    "ppx": 316.8148498535156,
+    "ppy": 231.83876037597656,
+    "model": "distortion.inverse_brown_conrady",
+    "coeffs": [
+      -0.05536484718322754,
+      0.06069551780819893,
+      0.0005584438913501799,
+      -7.875730079831555e-05,
+      -0.020695488899946213
+    ]
+  },
+  "T_tcp_from_color": [
+    [
+      0.9989848086833027,
+      -0.014533492316101931,
+      -0.04263953120149032,
+      -0.04190585874300775
+    ],
+    [
+      -0.022655011992755887,
+      0.656041960002202,
+      -0.7543843166106234,
+      0.12507932212515385
+    ],
+    [
+      0.03893716029184906,
+      0.7545844712936829,
+      0.6550466954583009,
+      -0.014162784707080546
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "T_color_from_tcp": [
+    [
+      0.9989848086833027,
+      -0.02265501199275589,
+      0.038937160291849064,
+      0.04524844844020279
+    ],
+    [
+      -0.01453349231610193,
+      0.6560419600022019,
+      0.754584471293683,
+      -0.07197930470853524
+    ],
+    [
+      -0.04263953120149032,
+      -0.7543843166106233,
+      0.6550466954583009,
+      0.10184831809296696
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "fit_frames": [
+    43,
+    208,
+    553,
+    763,
+    853,
+    988,
+    1168,
+    1348,
+    1948,
+    1978,
+    2533,
+    2968,
+    3208,
+    3598,
+    3748,
+    3898,
+    4018,
+    4288,
+    4408,
+    4558,
+    4888,
+    4963,
+    5068
+  ],
+  "heldout_frames": [
+    343,
+    928,
+    1633,
+    2893,
+    3658,
+    4213,
+    4768
+  ],
+  "calibration_status": "candidate_validated_on_heldout_video_not_grasping",
+  "validation": {
+    "raw_candidate_count": 121,
+    "distinct_count": 30,
+    "holdout_origin_rms_mm": 2.9532819139196462,
+    "holdout_origin_max_mm": 3.962161761984751,
+    "holdout_corner_rms_mm": 3.1491098578232037,
+    "holdout_corner_max_mm": 4.794067133138255,
+    "old_holdout_origin_rms_mm": 106.42066496851285,
+    "estimated_square_mm_from_arm_motion": 24.727529847914038,
+    "estimated_scale_holdout_origin_rms_mm": 2.8427117893351084,
+    "fixed_vs_estimated_scale_translation_difference_mm": 2.9329011956386046,
+    "holdout_rotation_max_deg": 0.6424458114226274,
+    "reprojection_median_px": 0.16036679959509953,
+    "reprojection_max_px": 0.24130011064997886,
+    "holdout_sync_max_ms": 21.797329
+  }
+}

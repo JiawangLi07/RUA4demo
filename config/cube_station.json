@@ -1,0 +1,176 @@
+{
+  "camera_serial": "241122305532",
+  "calibration": null,
+  "arm": "right",
+  "start_deg": [
+    97.25900268554688,
+    70.30699920654297,
+    -100.56729888916016,
+    -99.12969970703125,
+    19.05500030517578,
+    11.114700317382812,
+    -14.454099655151367
+  ],
+  "parked_deg": [
+    -98.40339660644531,
+    70.65059661865234,
+    95.97329711914062,
+    -97.86720275878906,
+    -24.190200805664062,
+    13.706899642944336,
+    5.631400108337402
+  ],
+  "joints_deg": [
+    [
+      -170.0,
+      170.0
+    ],
+    [
+      -120.0,
+      120.0
+    ],
+    [
+      -170.0,
+      170.0
+    ],
+    [
+      -144.99842921375742,
+      60.0
+    ],
+    [
+      -170.0,
+      170.0
+    ],
+    [
+      -60.0,
+      60.0
+    ],
+    [
+      -90.0,
+      90.0
+    ]
+  ],
+  "workspace_m": null,
+  "up_axis_mount": [
+    0.0,
+    0.0,
+    1.0
+  ],
+  "cube_m": null,
+  "tcp_offset_m": null,
+  "red_cube_roi_xyxy": null,
+  "hand_open_rad": [
+    0.16881050169467926,
+    0.08476750552654266,
+    0.8625887632369995,
+    -0.1998976469039917,
+    0.23610980808734894,
+    0.24149760603904724,
+    0.007088594138622284,
+    0.21301428973674774,
+    0.08215384930372238,
+    0.21814368665218353,
+    0.10921682417392731,
+    0.1624188870191574,
+    0.2095421552658081,
+    0.1820346564054489,
+    0.21277202665805817,
+    0.3541487455368042,
+    0.10285460948944092,
+    0.10903532803058624,
+    0.06606262922286987,
+    0.2754378020763397,
+    0.6108773946762085,
+    0.05108143016695976
+  ],
+  "hand_grasps_rad": {
+    "teleop_pinch": [
+      0.6381161212921143,
+      -0.05594626069068909,
+      0.8566855192184448,
+      -0.24453337490558624,
+      0.05621771886944771,
+      0.8723247647285461,
+      -0.005136609077453613,
+      0.28178316354751587,
+      0.2058471292257309,
+      1.240139365196228,
+      -0.0838366225361824,
+      1.0678579807281494,
+      0.9354325532913208,
+      1.1954219341278076,
+      -0.1784508228302002,
+      1.0666385889053345,
+      0.43853238224983215,
+      0.14037512242794037,
+      0.8048582077026367,
+      -0.049644261598587036,
+      1.3405990600585938,
+      0.20601826906204224
+    ]
+  },
+  "hand_max_abs_torque": null,
+  "arm_max_abs_est_wrench": null,
+  "rig": {
+    "camera_serials": {
+      "head": "241122305532",
+      "left_wrist": "262422271713",
+      "right_wrist": "260522271432"
+    },
+    "tianji_ip": "192.168.1.190",
+    "sharpa_serials": {
+      "left": "C65E9038C65F",
+      "right": "CA56933FCA57"
+    },
+    "urdf_sha256": "c22ea092daf9c63aaacc2cb704879ad20965139e9d0ad49d512b76478411243c"
+  },
+  "provenance": {
+    "color_depth_calibration": "d455_replay_profile.json",
+    "teleop_home_config": "/home/admin2026/guchenyang/Project/wuji-hand-teleop/MuJoCo-Marvin/config/tianji_robot.yaml",
+    "teleop_home_profile": "default",
+    "teleop_home_deg": {
+      "left": [
+        -94.16,
+        70.01,
+        106.42,
+        -97.91,
+        -20.45,
+        5.88,
+        18.17
+      ],
+      "right": [
+        94.16,
+        70.01,
+        -106.42,
+        -97.91,
+        20.45,
+        5.88,
+        -18.17
+      ]
+    },
+    "demonstration_origin": "/home/admin2026/lianjh/real_experiment/deployment/assets/references/badminton_demo_origin.json",
+    "recording": "/home/admin2026/lianjh/real_experiment/deployment/data/episodes_badminton/episode_0212/robot_states.h5",
+    "recording_sha256": "933b17d5b63944ab01776c8c503d9770cb1a039e80c154b5b386b3bc7e71d27f",
+    "arm_row": 4,
+    "hand_open_row": 10,
+    "hand_grasp_row": 308,
+    "hand_grasp_seconds_from_first_sample": 8.369,
+    "hand_grasp_context": "Same right hand, recorded badminton thumb/index engagement; cube suitability untested.",
+    "joint_limits_source": "Intersection of active teleop URDF limits and deployed Tianji controller configuration.",
+    "recorded_tcp_bounds_m": [
+      [
+        -0.32044281071720965,
+        -0.15836874105111584
+      ],
+      [
+        -0.6392133888785352,
+        -0.4433629199798924
+      ],
+      [
+        -0.22218753545923545,
+        0.07818625861035504
+      ]
+    ],
+    "recorded_tcp_bounds_axes": "dual_arm_mount X Y Z; motion trace only"
+  }
+}

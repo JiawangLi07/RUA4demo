@@ -1,0 +1,212 @@
+{
+  "camera_serial": "241122305532",
+  "calibration": "d455_mount_from_color.json",
+  "right_wrist_calibration": "d405_right_wrist_tcp_from_color.json",
+  "arm": "right",
+  "start_deg": [
+    92.36,
+    70.2099,
+    -107.1849,
+    -96.5119,
+    21.0369,
+    7.7336,
+    -17.032
+  ],
+  "parked_deg": [
+    -91.1078,
+    79.5005,
+    98.0041,
+    -100.2772,
+    -37.2334,
+    -5.084,
+    18.025
+  ],
+  "joints_deg": [
+    [
+      -170.0,
+      170.0
+    ],
+    [
+      -120.0,
+      120.0
+    ],
+    [
+      -170.0,
+      170.0
+    ],
+    [
+      -144.99842,
+      60.0
+    ],
+    [
+      -170.0,
+      170.0
+    ],
+    [
+      -60.0,
+      60.0
+    ],
+    [
+      -90.0,
+      90.0
+    ]
+  ],
+  "workspace_m": null,
+  "up_axis_mount": [
+    0.0005361758,
+    -0.0135352761,
+    0.9999082502
+  ],
+  "tcp_offset_m": null,
+  "hand_open_rad": [
+    0.38829678297042847,
+    0.3276745676994324,
+    0.0519481897354126,
+    0.3486678898334503,
+    0.6544567346572876,
+    0.044641297310590744,
+    0.050061266869306564,
+    0.00031414272962138057,
+    0.02142220363020897,
+    0.053904853761196136,
+    0.1839066445827484,
+    0.011323320679366589,
+    0.0018051746301352978,
+    0.08940893411636353,
+    0.2911759316921234,
+    0.01342091429978609,
+    0.016978662461042404,
+    0.015505067072808743,
+    0.0304989293217659,
+    0.19677141308784485,
+    0.0358126237988472,
+    0.023927543312311172
+  ],
+  "hand_grasps_rad": null,
+  "hand_max_abs_torque": null,
+  "arm_max_abs_est_wrench": null,
+  "input_sources": {
+    "initial_pose": "live_feedback",
+    "hand_targets": null
+  },
+  "clearance": {
+    "plane_height_m": -0.33918,
+    "table_xy_bounds_m": [[-1.26, -1.70], [1.24, -0.43]],
+    "table_margin_m": 0.0313,
+    "finger_table_margin_m": 0.004,
+    "interarm_margin_m": 0.04
+  },
+  "target": "shuttlecock",
+  "target_m": null,
+  "target_roi_xyxy": [
+    0,
+    0,
+    640,
+    480
+  ],
+  "rig": {
+    "camera_serials": {
+      "head": "241122305532",
+      "left_wrist": "262422271713",
+      "right_wrist": "260522271432"
+    },
+    "sharpa_serials": {
+      "left": "C65E9038C65F",
+      "right": "CA56933FCA57"
+    },
+    "tianji_ip": "192.168.1.190",
+    "urdf_sha256": "c22ea092daf9c63aaacc2cb704879ad20965139e9d0ad49d512b76478411243c"
+  },
+  "provenance": {
+    "initial_pose_reference": "Independent idle joint readback in the last of the static captures below. The controller compares both arms and the open hand before enabling.",
+    "static_frames": [
+      {
+        "host_directory": "runs/20261118T073120-wi89_xsw",
+        "frame_id": "f54893e71bd74e759bd7453d83261564",
+        "sha256_observation": "3461303dfb72a007ee78e6e0987da3e88482051425d1ba816533e6e8cf0c578f",
+        "sha256_native_depth": "e66dbae2fddbe634496c8ef0b63228e53d2c0a7288c9763ef50704aac89ac934",
+        "joint_camera_skew_ms": 1.053999,
+        "plane_inliers": 90904,
+        "plane_rms_mm": 1.621,
+        "plane_normal_mount": [
+          0.0010261737945396958,
+          -0.013668780851633706,
+          0.9999060512855062
+        ],
+        "plane_height_m": -0.3392708098944925
+      },
+      {
+        "host_directory": "runs/20261118T073404-k96ye5si",
+        "frame_id": "d0855c7d376648ec801bdd82e2ba929c",
+        "sha256_observation": "e88eb6d8fcfa32fd4f9494a06fd1e4d603f057a34f76d65f162715c69731edb4",
+        "sha256_native_depth": "7e828357d7c809fe300a72c41b8a5699f79f09df4aaae6a1073c6f36d07b6c0f",
+        "joint_camera_skew_ms": 1.121436,
+        "plane_inliers": 91147,
+        "plane_rms_mm": 1.581,
+        "plane_normal_mount": [
+          0.000421274286282288,
+          -0.013831845846541986,
+          0.9999042466998793
+        ],
+        "plane_height_m": -0.3391794938802746
+      },
+      {
+        "host_directory": "runs/20261118T074315-7bsln2m3",
+        "frame_id": "bf1313e3c73b4422ad74ebaee56382f0",
+        "sha256_observation": "f05e55739c475855b4b9b6beb1b9ab0678ee53d60569d035f117aef43df7169e",
+        "sha256_native_depth": "56907adcaa1075dd6077b4c1374cb8911aaf0190def6f21653476c2ce64a1616",
+        "joint_camera_skew_ms": 1.088345,
+        "plane_inliers": 90605,
+        "plane_rms_mm": 1.574,
+        "plane_normal_mount": [
+          0.00016107916417276277,
+          -0.01310519684242785,
+          0.9999141102460871
+        ],
+        "plane_height_m": -0.33953128594091436
+      }
+    ],
+    "max_static_drift": {
+      "arm_deg": 0.0001,
+      "right_hand_rad": 4.563e-05
+    },
+    "arm_limits": "Intersection of deployed Tianji SDK config and both right-arm URDF limits, rounded inward. Hardware travel only; Cartesian workcell bounds are a separate field.",
+    "arm_description_sha256": "c22ea092daf9c63aaacc2cb704879ad20965139e9d0ad49d512b76478411243c",
+    "secondary_arm_description_sha256": "c22ea092daf9c63aaacc2cb704879ad20965139e9d0ad49d512b76478411243c",
+    "open_hand_geometry": {
+      "model": "/home/admin2026/guchenyang/Project/Universal_Robot_infra/assets/robot/sharpa_wave/right_sharpa_wave/right_sharpa_wave.urdf",
+      "sha256": "7a9ab7f824482d23765b2da40b7e96fc605e7e70eda4615a5ca51fea88afb845",
+      "modeled_thumb_index_tip_distance_mm": 70.64
+    },
+    "extrinsics_sha256": "adeebe54c78e328e70b8f50299ea29e6704085111404fcbaa1787aeadcf57319",
+    "camera_role_mapping": [
+      "deployment/src/infra_state_client.py",
+      "deployment/src/easywam_worker.py"
+    ],
+    "table_fit": "Plane fitted independently to registered raw depth in three static sensor captures, residual cutoff 4 mm, tabletop normal in dual_arm_mount. Table XY bounds enclose the planar returns of the same three captures.",
+    "table_cross_check": {
+      "report": "runs/20261118T071927-mq92gkkv/right_shuttle_scene.json",
+      "max_normal_difference_deg": 0.0699,
+      "max_plane_height_difference_mm": 0.428
+    },
+    "start_tcp_mount_m": [
+      -0.25623553871784294,
+      -0.42767293967583897,
+      -0.24623494346547115
+    ],
+    "target_search": "Full calibrated RGB frame, with online single-target detection; target_m intentionally stays null.",
+    "unloaded_hand_candidate": {
+      "file": "right_pinch_24mm.candidate.json",
+      "sha256": "9a98c10cf35e7d9408dcbdf9a8e8101d42a6348d3c9bdbf7bce7ff7047b6a228",
+      "kind": "offline_kinematic_proposal",
+      "selected_for_motion": false
+    },
+    "remaining_field_evidence": {
+      "workspace_m": "Only tabletop geometry verified in dual_arm_mount. /home/admin2026/guchenyang/Project/Sharpa-Robot/Code/Sharpa-Manus-Haptic/teleop/config/teleop.json defines a shoulder-frame TA2 box with workspace_calibrated=false.",
+      "tcp_offset_m": "The controller needs measured target-visible-surface to right TCP displacement in dual_arm_mount at the grasp. The archived hand alignment diagnostic has a 21.27 mm maximum residual; nominal CAD fingertip vectors alone do not measure this transform.",
+      "hand_grasps_rad": "See the separate model-only candidate. The robot_ops adaptive-grasp anchor metadata is joint_gui_target and is not a commissioned autonomous precision-pinch primitive for this station.",
+      "hand_max_abs_torque": "config/force_limits_baseline.json: all 22 right-hand resting peaks zero, 0.001 proposal floor. Sharpa adaptive-grasp right.yaml lists change-from-baseline group thresholds, not 22 absolute contact limits.",
+      "arm_max_abs_est_wrench": "config/force_limits_baseline.json: all six resting disturbance estimates zero. The independent arm commissioning log runs/20261118T061444-32u7r__9/arm_step.jsonl also reports zero estimated Cartesian disturbance while joint torques vary."
+    }
+  }
+}

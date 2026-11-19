@@ -1,0 +1,37 @@
+diff --git a/src/pyrualean/hosts/sam3_http.py b/src/pyrualean/hosts/sam3_http.py
+index f6f3f12..6d5223c 100644
+--- a/src/pyrualean/hosts/sam3_http.py
++++ b/src/pyrualean/hosts/sam3_http.py
+@@ -28,6 +28,7 @@ import base64
+ import json
+ import threading
+ import urllib.error
++import urllib.parse
+ import urllib.request
+ from typing import Any
+ 
+@@ -70,10 +71,14 @@ class Sam3Http:
+             endpoint = "http://" + endpoint
+         self.endpoint = endpoint.rstrip("/")
+         self.timeout_s = float(timeout_s)
++        if urllib.parse.urlsplit(self.endpoint).hostname in ("127.0.0.1", "localhost", "::1"):
++            self._open = urllib.request.build_opener(urllib.request.ProxyHandler({})).open
++        else:
++            self._open = urllib.request.urlopen
+ 
+     def alive(self) -> bool:
+         try:
+-            with urllib.request.urlopen(self.endpoint + "/health", timeout=5) as resp:
++            with self._open(self.endpoint + "/health", timeout=5) as resp:
+                 return json.loads(resp.read()).get("ok") is True
+         except (OSError, ValueError):
+             return False
+@@ -110,7 +115,7 @@ class Sam3Http:
+             self.endpoint + "/segment", data=body, headers={"Content-Type": "application/json"}
+         )
+         try:
+-            with urllib.request.urlopen(request, timeout=self.timeout_s) as resp:
++            with self._open(request, timeout=self.timeout_s) as resp:
+                 answer = json.loads(resp.read())
+         except urllib.error.HTTPError as exc:
+             detail = exc.read().decode(errors="replace")[:300]

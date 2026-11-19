@@ -1,0 +1,21 @@
+{
+  "camera_serial": "241122305532",
+  "calibration": "d455_mount_from_color.json",
+  "arm": "right",
+  "start_deg": null,
+  "parked_deg": null,
+  "joints_deg": null,
+  "workspace_m": null,
+  "up_axis_mount": null,
+  "cube_m": null,
+  "tcp_offset_m": null,
+  "red_cube_roi_xyxy": null,
+  "hand_open_rad": null,
+  "hand_grasps_rad": null,
+  "hand_max_abs_torque": null,
+  "arm_max_abs_est_wrench": null,
+  "input_sources": {
+    "initial_pose": "station_measurement",
+    "hand_targets": "hardware_primitive"
+  }
+}

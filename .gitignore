@@ -1,0 +1,13 @@
+.capture.lock
+.venv/
+__pycache__/
+local_runs/
+runs/
+upstream/
+upstream-rsijudge/
+.local/
+.pytest_cache/
+*.py[cod]
+.env
+.env.*
+README.station-local.md
