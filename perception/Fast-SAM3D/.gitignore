@@ -1,0 +1,8 @@
+/.venv
+__pycache__/
+*.pyc
+checkpoints/dinov2
+checkpoints/moge-vitl
+Look/
+Generate/
+/visualization/

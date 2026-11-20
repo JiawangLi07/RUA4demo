@@ -1,0 +1,61 @@
+{
+  "huggingface_commit": "2e73555018d2741ccd486e56c24fac41155a1dc6",
+  "files": [
+    {
+      "path": "checkpoints/slat_decoder_gs.ckpt",
+      "bytes": 171476155,
+      "sha256": "f8077c36a06eaf890dd93cda1937411f793dea1eb80b3dd9329f2038ba84a111",
+      "modelscope_commit": "64ec50f24a12eb631aceff750993d162d751dc25",
+      "hf_pointer_oid": "5a36371eaa8b504f6d3210fdf00ac8e8d72683bc"
+    },
+    {
+      "path": "checkpoints/slat_decoder_gs_4.ckpt",
+      "bytes": 170269801,
+      "sha256": "731a0eceaa47945b52aa27f650d695b2aea9cc70945751e5609e5cb5b49f0186",
+      "modelscope_commit": "64ec50f24a12eb631aceff750993d162d751dc25",
+      "hf_pointer_oid": "f59fba1a23cf9a1ad7835b0f622e71fe01e4a2f6"
+    },
+    {
+      "path": "checkpoints/slat_decoder_mesh.ckpt",
+      "bytes": 363726862,
+      "sha256": "85907b37b67d8ce5b099a96629bdcfbd873eb407dee6b3aa9a75deb15038db33",
+      "modelscope_commit": "64ec50f24a12eb631aceff750993d162d751dc25",
+      "hf_pointer_oid": "49b72a3de8080e4980438f492dd941eca96ccf67"
+    },
+    {
+      "path": "checkpoints/slat_encoder.ckpt",
+      "bytes": 173263986,
+      "sha256": "6485623145535f42c8afa4cbb68ab9953e54e2f0c1cb1eaf95dcb41051e10181",
+      "modelscope_commit": "b7f2543810586d96ce6185e549f4d695e51560a8",
+      "hf_pointer_oid": "461b1c82487670b9e16080774460f55db27dd592"
+    },
+    {
+      "path": "checkpoints/slat_generator.ckpt",
+      "bytes": 4906537684,
+      "sha256": "91529bde8e7daa12d09618a66c319e3a5a6398db6b23b958cedcb1c3f28faabb",
+      "modelscope_commit": "64ec50f24a12eb631aceff750993d162d751dc25",
+      "hf_pointer_oid": "105cb187b9ec704ac254e17a5190c16e2be84317"
+    },
+    {
+      "path": "checkpoints/ss_decoder.ckpt",
+      "bytes": 147609242,
+      "sha256": "6dac1cd7b7fda5a38e0614fadae441f1794f80e39ea2981f1ac8aff0a7e99340",
+      "modelscope_commit": "64ec50f24a12eb631aceff750993d162d751dc25",
+      "hf_pointer_oid": "e9a1a9fc9e881163b78b4033dc4d7ca3d7b4014d"
+    },
+    {
+      "path": "checkpoints/ss_encoder.ckpt",
+      "bytes": 119085402,
+      "sha256": "dcc47810ac568b11fe6e4821ea1c8d6b960dfbda3e5f68e94c19f44b3bf9e83b",
+      "modelscope_commit": "b7f2543810586d96ce6185e549f4d695e51560a8",
+      "hf_pointer_oid": "67a98d185878ea83fa256401d407d7a4d66dcb42"
+    },
+    {
+      "path": "checkpoints/ss_generator.ckpt",
+      "bytes": 6690136964,
+      "sha256": "225f40479e4cff4f39d6fa14c55be3abad1475bf55b61af3bec1e19ed2f6c146",
+      "modelscope_commit": "64ec50f24a12eb631aceff750993d162d751dc25",
+      "hf_pointer_oid": "22fb7b40c378df44e3736a763c9a764fde8fe1ed"
+    }
+  ]
+}

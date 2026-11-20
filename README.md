@@ -78,3 +78,44 @@ OPENBLAS_NUM_THREADS=1 ./run.sh explore --real --single-cell \
 1. 运行 `./run.sh observe --live --calibration config/d455_mount_from_color.json`。输出中的 `run` 是这次观测目录，打开其中的 `head.png` 查看工位。该模式同时保存归位需要的关节回读。只看画面时可以加 `--camera-only`。
 2. 运行 `./run.sh reset-shuttle <本次观测目录>` 离线检查归位路径。在命令末尾加 `--execute` 执行真机归位。脚本从工位配置读取右臂起始角，从本机的 `.local/station/reset_right_hand.json` 读取右手目标手形（22 个弧度值的 JSON 数组，也可用 `--hand-reference` 指定）。首次部署可从已验证起始姿态观测的 `observation.json` 中提取 `joints.hand_rad.right`。脚本随后核对当前关节状态，归位后记录角度误差及手的去使能回读。已在起始位的右臂会跳过臂运动。
 3. 运行 `./perception/ensure_sam3.sh` 检查本机 SAM3。健康时直接返回，掉线时后台启动服务并等待健康响应。默认端口为 8790，启动日志在 `.local/sam3/8790.log`。此命令可在每次试抓前重复调用。
+
+## Fast-SAM3D 单图三维重建
+
+推理代码位于 [perception/Fast-SAM3D](perception/Fast-SAM3D)，基于 [Fast-SAM3D 上游版本 c76188f](https://github.com/wlfeng0509/Fast-SAM3D/tree/c76188fda755b761fe9255eabe87aaad39df829a)。输入为一张 RGB 图和一个同分辨率的物体掩膜。启动脚本默认启用 Fast-SAM3D 加速，使用 25 个采样步，关闭蒸馏。
+
+### 环境和权重
+
+使用已有的 Fast-SAM3D 环境，或按[上游安装说明](perception/Fast-SAM3D/README.md#installation)准备 CUDA 和 Python 依赖。本机验证环境为 RTX 4090、Python 3.11、PyTorch 2.5.1+cu121。请保留仓库中的加速配置 YAML，将 SAM 3D Objects 的 `*.ckpt` 放在 `perception/Fast-SAM3D/checkpoints/hf/`，MoGe 权重放在 `checkpoints/moge-vitl/model.pt`，DINOv2 源码放在 `checkpoints/dinov2/`（本机验证提交 `7764ea0f`）。[官方权重](https://huggingface.co/facebook/sam-3d-objects) · [ModelScope 权重](https://modelscope.cn/models/facebook/sam-3d-objects) · [SHA-256 校验清单](perception/Fast-SAM3D/checkpoints/verified-weights.json)
+
+在已有部署的工位上，可从 RUA4demo 根目录复用环境和权重。下面的链接命令适用于首次配置的检出目录。
+
+```bash
+cd perception/Fast-SAM3D
+station_model_dir="$HOME/lianjh/Fast-SAM3D"
+export FAST_SAM3D_PYTHON="$station_model_dir/.venv/bin/python"
+ln -s "$station_model_dir"/checkpoints/hf/*.ckpt checkpoints/hf/
+ln -s "$station_model_dir/checkpoints/moge-vitl" checkpoints/
+ln -s "$station_model_dir/checkpoints/dinov2" checkpoints/
+```
+
+### 体素模式和蒸馏开关
+
+在 `perception/Fast-SAM3D` 目录运行以下命令即可使用随附样例。处理自己的图片时，追加 `--image_path /绝对路径/image.png --mask_index 0`，并将目标掩膜保存到同目录的 `0.png`。灰度掩膜中非零值为前景，RGBA 掩膜使用 alpha 通道。分别运行两种模式时使用不同输出目录。
+
+```bash
+# 25 步体素，关闭蒸馏
+./infer.sh --voxel-only --steps 25 --output_dir Look/voxel25-off
+
+# 25 步体素，开启第一阶段蒸馏推理
+./infer.sh --voxel-only --distill-stage1 --steps 25 --output_dir Look/voxel25-on
+```
+
+| 参数 | 行为 |
+| --- | --- |
+| `--voxel-only` | 第一阶段结束即返回，导出 `voxels-<mask_index>.npz`。省略此参数时继续第二阶段，导出 GLB 网格和 PLY 点云。 |
+| `--distill-stage1` | 将 `use_stage1_distillation` 设为 `True`，使用现有权重的第一阶段 shortcut 推理。省略时关闭。 |
+| `--steps N` | 指定采样步数。体素模式只运行第一阶段。 |
+
+NPZ 中的 `native_coords` 是自适应降采样前的物体局部占用网格索引，形状为 `(N, 3)`，每个轴取值 0–63。比较蒸馏前后的体素 IoU 时应使用此字段。`coords` 保存降采样后的索引，`voxel` 保存模型返回的归一化坐标，`downsample_factor` 保存降采样因子。转换到机器人基座系还需要度量尺度、物体位姿和相机外参。
+
+主视角 14 件物体的工位实测中，模型常驻、同帧深度共享、均使用 25 步时，整桌体素推理关闭蒸馏为 **21.17 秒**，开启为 **13.13 秒**。两项均排除模型加载、分割和写盘。分别执行上述 shell 命令会启动新进程并重新加载模型；同一帧多掩膜复用模型和深度的调用见[测速脚本](perception/Fast-SAM3D/notebook/benchmark_voxel_frame.py)。
