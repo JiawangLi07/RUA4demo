@@ -7,6 +7,11 @@ export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$deployment/src:$deployment/vendor/bridge:$deployment/deps/infra:$deployment/deps/observer:$deployment/vendor/universal_robot_infra/src:$deployment/assets/robot:$deployment/vendor/mujoco_marvin:$deployment/sdk/sharpa/python:$root/upstream/src:$root/.venv/lib/python3.10/site-packages"
 export MARVIN_SDK_DIR="$deployment/sdk/tianji"
 export SHARPA_SDK_PY="$deployment/sdk/sharpa/python"
+if [[ "${1:-}" == reset-shuttle ]]; then
+    shift
+    export PYTHONPATH="$root/upstream-rsijudge/src:$root:$PYTHONPATH"
+    exec "$deployment/envs/robot/bin/python" -m exploration.reset_shuttle "$@"
+fi
 if [[ "${1:-}" == task || "${1:-}" == task-server ]]; then
     subcommand=$1
     shift

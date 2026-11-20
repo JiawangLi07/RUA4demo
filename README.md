@@ -70,3 +70,11 @@ OPENBLAS_NUM_THREADS=1 ./run.sh explore --real --single-cell \
 - `pinch_commands.jsonl` 保存闭合、卸力和补抓指令，以及相应的关节回读和触觉值。
 
 核心逻辑的离线回归用例见 [tests](tests)，其中包括预抓手形、三段接近、单指保持、接触不稳定时补抓、收紧和提起判定。
+
+## 可重复执行的工位操作
+
+在机器人主机的仓库根目录执行。以下步骤独立于抓取 cell。
+
+1. 运行 `./run.sh observe --live --calibration config/d455_mount_from_color.json`。输出中的 `run` 是这次观测目录，打开其中的 `head.png` 查看工位。该模式同时保存归位需要的关节回读。只看画面时可以加 `--camera-only`。
+2. 运行 `./run.sh reset-shuttle <本次观测目录>` 离线检查归位路径。在命令末尾加 `--execute` 执行真机归位。脚本从工位配置读取右臂起始角，从本机的 `.local/station/reset_right_hand.json` 读取右手目标手形（22 个弧度值的 JSON 数组，也可用 `--hand-reference` 指定）。首次部署可从已验证起始姿态观测的 `observation.json` 中提取 `joints.hand_rad.right`。脚本随后核对当前关节状态，归位后记录角度误差及手的去使能回读。已在起始位的右臂会跳过臂运动。
+3. 运行 `./perception/ensure_sam3.sh` 检查本机 SAM3。健康时直接返回，掉线时后台启动服务并等待健康响应。默认端口为 8790，启动日志在 `.local/sam3/8790.log`。此命令可在每次试抓前重复调用。
