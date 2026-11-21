@@ -79,6 +79,8 @@ def test_offline_score_requires_an_executed_closure_and_two_loaded_seconds(
             [
                 (0.2, "attempt_start"),
                 (0.3, "close"),
+                (1.5, "hold_start"),
+                (3.6, "hold_end"),
                 (4.05, "lower_and_release"),
                 (4.4, "attempt_end"),
             ],
@@ -101,6 +103,7 @@ def test_offline_score_requires_an_executed_closure_and_two_loaded_seconds(
     )
     result = tabletop_score.evaluate(scene, tmp_path)
     assert result["stable"] == 1 and result["closed"] == 1
+    assert result["raised"] == 1 and result["held_through_end"] == 1
     assert not result["per_object"]["test"][0]["closure"]
     # A 6 cm raise clears the current 5 cm acceptance height, but misses the earlier goal.
     obj[140:390, 0, 2] -= 0.045
@@ -109,6 +112,10 @@ def test_offline_score_requires_an_executed_closure_and_two_loaded_seconds(
     (tmp_path / "trial_settings.json").write_text(json.dumps({"lift_height_m": 0.05}))
     assert tabletop_score.evaluate(scene, tmp_path)["stable"] == 1
     assert tabletop_score.evaluate(scene, tmp_path, 0.09)["stable"] == 0
+    next(e for e in events if e["phase"] == "hold_end")["time"] = 4.0
+    (tmp_path / "events.jsonl").write_text("\n".join(json.dumps(e) for e in events))
+    slipped = tabletop_score.evaluate(scene, tmp_path)
+    assert slipped["stable"] == 1 and slipped["held_through_end"] == 0
     forces[140:390, 0] = 0.0
     np.savez(tmp_path / "physics_audit.npz", **recording)
     assert tabletop_score.evaluate(scene, tmp_path)["stable"] == 0

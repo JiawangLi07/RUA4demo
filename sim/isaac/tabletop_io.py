@@ -47,6 +47,7 @@ class PhysicsRecording:
                 s.robot.data.body_quat_w[0, i],
                 magnitudes.sum(dim=0),
                 *(magnitudes[ids].sum(dim=0) for ids in self.digit_links),
+                magnitudes.reshape(-1),
                 s.robot.data.joint_pos[0],
             ]
         )
@@ -66,6 +67,8 @@ class PhysicsRecording:
         rows = np.concatenate(self.chunks)
         n = len(self.names)
         end = 7 * n
+        link_start = end + 7 + 6 * n
+        link_end = link_start + len(self.right) * n
         np.savez_compressed(
             self.out / "physics_audit.npz",
             object_names=self.names,
@@ -74,7 +77,11 @@ class PhysicsRecording:
             hand_load_N=rows[:, end + 7 : end + 7 + n],
             digit_load_N=rows[:, end + 7 + n : end + 7 + 6 * n].reshape(-1, 5, n),
             digit_names=["thumb", "index", "middle", "ring", "pinky"],
-            q_measured=rows[:, end + 7 + 6 * n :],
+            right_link_names=[self.scene.contact_names[i] for i in self.right],
+            right_link_load_N=rows[:, link_start:link_end].reshape(
+                -1, len(self.right), n
+            ),
+            q_measured=rows[:, link_end:],
             dt=self.scene.config["physics_dt"],
             table_z=self.table,
         )
@@ -98,14 +105,18 @@ def connect(scene, out):
     for k in (head_k, wrist_k):
         k[:2, 2] -= 0.5
 
-    def q():
-        return scene.robot.data.joint_pos[0].cpu().numpy().astype(float, copy=True)
+    command = scene.target[0].cpu().numpy().astype(float, copy=True)
+
+    def commanded_joints():
+        return command.copy()
 
     def fk(link, angles=None):
-        return tree.pose(link, dict(zip(names, q() if angles is None else angles)))
+        return tree.pose(link, dict(zip(names, command if angles is None else angles)))
+
+    palm_eye = np.linalg.solve(fk(PALM), fk("TCP_Link_R")) @ eye
 
     def camera(role):
-        angles = q()
+        angles = commanded_joints()
         if role == "head":
             sensor, pose, k = head, head_pose, head_k
         elif role == "wrist":
@@ -114,11 +125,21 @@ def connect(scene, out):
                 fk("TCP_Link_R", angles) @ eye,
                 wrist_k,
             )
-            quat = np.roll(Rotation.from_matrix(pose[:3, :3]).as_quat(), 1).astype(
-                "float32"
+            # The rendered image must move with the physical mount even if the
+            # arm lags its setpoint. The planner receives only nominal hand-eye calibration.
+            body = scene.palm_ids["right"]
+            render_pose = (
+                pose_matrix(
+                    scene.robot.data.body_pos_w[0, body].cpu().numpy(),
+                    scene.robot.data.body_quat_w[0, body].cpu().numpy(),
+                )
+                @ palm_eye
             )
+            quat = np.roll(
+                Rotation.from_matrix(render_pose[:3, :3]).as_quat(), 1
+            ).astype("float32")
             sensor.set_world_poses(
-                pose[None, :3, 3].astype("float32"), quat[None], convention="ros"
+                render_pose[None, :3, 3].astype("float32"), quat[None], convention="ros"
             )
             scene.world.render()
         else:
@@ -132,10 +153,12 @@ def connect(scene, out):
             "K": k.copy(),
             "pose": pose.copy(),
             "q": angles,
+            "joint_source": "command",
             "time": scene.time,
         }
 
     def step(arm_q, hand_q):
+        command[arm], command[hand] = arm_q, hand_q
         scene.target[0, arm] = scene.target.new_tensor(arm_q)
         scene.target[0, hand] = scene.target.new_tensor(hand_q)
         scene.advance_dynamics()
@@ -155,7 +178,7 @@ def connect(scene, out):
         limits=scene.limits,
     )
     return SimpleNamespace(
-        q=q,
+        commanded_joints=commanded_joints,
         step=step,
         fk=fk,
         camera=camera,
@@ -167,6 +190,6 @@ def connect(scene, out):
         dt=dt,
         bounds=bounds,
         model=model,
-        palm_from_wrist=np.linalg.solve(fk(PALM), fk("TCP_Link_R")) @ eye,
+        palm_from_wrist=palm_eye,
         wrist_K=wrist_k,
     ), audit

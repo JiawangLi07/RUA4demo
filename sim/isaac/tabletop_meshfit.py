@@ -1,5 +1,7 @@
 """Fit a Sharpa palm pose and independent finger angles to a wrist-registered metric surface."""
 
+import itertools
+
 import numpy as np
 from scipy.optimize import lsq_linear
 from scipy.spatial import ConvexHull
@@ -412,7 +414,7 @@ def refine(controller, family, surface, candidates, others):
         for initial in (controller.arm, controller.mid_arm):
             try:
                 qa = controller.ik.solve(pre, initial)
-                controller.ik.solve(palm, qa)
+                controller.lift_ik(palm, qa)
             except ValueError:
                 continue
             break
@@ -476,71 +478,89 @@ def refine(controller, family, surface, candidates, others):
     return card, poses, angle
 
 
-def close_from_mesh(controller, seed):
-    io = controller.io
-    hand = controller.hand_contacts
-    contacts = seed["fit_sites"]
-    lo, hi = io.model.limits["right"].T
-    groups = {
-        d: np.array(
-            [i for i, n in enumerate(hand.names) if n.startswith("right_" + d + "_")]
+def closure_path(hand, palm, initial, contacts, limits, table):
+    """Continue opposed surface contacts inward in the commanded hand's kinematic model."""
+    sites = [c for c in contacts if c["link"] != PALM]
+    thumb = next(c for c in sites if "thumb" in c["link"])
+    opponents = [c for c in sites if "thumb" not in c["link"]]
+    depths, start_depths = [], []
+    for c in sites:
+        opposite = opponents if "thumb" in c["link"] else [thumb]
+        width = max(abs((c["goal"] - o["goal"]) @ c["normal"]) for o in opposite)
+        if "section_width" in c:
+            width = c["section_width"]
+            depth = np.clip(0.30 * width, 0.002, 0.010)
+        else:
+            depth = np.clip(0.13 * width, 0.0015, 0.008)
+        depths.append(float(depth))
+        p = hand.point_jac(c, palm, initial)[0]
+        start_depths.append(
+            np.clip((c["goal"] - p) @ c["normal"], min(0.002, depth), depth)
         )
-        for d in FINGERS
-    }
-    active = [d for d in FINGERS if any("_" + d + "_" in c["link"] for c in contacts)]
-    retained = {d: 0 for d in active}
-    held = set()
-    last = {}
-    controller.event("continuous_mesh_closure")
-    for iteration in range(29):
-        positions = io.q()
-        palm = io.fk(PALM, positions)
-        actual = positions[io.hand]
-        command = controller.hand.copy()
-        nxt = command.copy()
-        for digit in active:
-            ids = groups[digit]
-            js = []
-            errors = []
-            gaps = []
-            for c in contacts:
-                if "_" + digit + "_" not in c["link"]:
-                    continue
-                p, _, j, _ = hand.point_jac(c, palm, actual)
-                gap = float((p - c["goal"]) @ c["normal"])
-                gaps.append(gap)
-                squeeze = min(0.008, 0.002 + iteration * 0.00040)
-                js.append(c["weight"] * j[:, 6 + ids])
-                errors.append(c["weight"] * (c["goal"] - squeeze * c["normal"] - p))
-            flex = [
-                i for i in ids if hand.names[i].endswith(("_FE", "PIP", "DIP", "_IP"))
-            ]
-            lag = float(np.max(np.abs(command[flex] - actual[flex])))
-            retained[digit] = (
-                retained[digit] + 1
-                if lag > 0.055 and min(abs(np.array(gaps))) < 0.010
-                else 0
-            )
-            if retained[digit] >= 3:
-                held.add(digit)
-            elif lag < 0.025 or min(abs(np.array(gaps))) > 0.013:
-                held.discard(digit)
-            last[digit] = [round(lag, 4), round(float(min(gaps, key=abs)), 4)]
-            if digit in held:
-                continue
-            j = np.vstack(js)
-            error = np.concatenate(errors)
-            dq = np.linalg.solve(j.T @ j + 0.000044 * np.eye(len(ids)), j.T @ error)
-            nxt[ids] += np.clip(actual[ids] + dq - command[ids], -0.068, 0.068)
-        nxt = np.clip(nxt, lo, hi)
-        for k in range(1, 11):
-            io.step(controller.arm, command + (nxt - command) * k / 10)
-        controller.hand = nxt
-        if iteration >= 11 and "thumb" in held and len(held) >= min(3, len(active)):
-            break
-    controller.event(
-        "mesh_closure_readback",
-        iterations=iteration + 1,
-        blocked_near_surface=sorted(held),
-        finger_lag_and_gap=last,
+    q = np.clip(initial, *limits.T)
+    path = [q.copy()]
+    gaps = {}
+    for phase in np.linspace(0.0, 1.0, 18):
+        jac, error = [], []
+        for c, depth, start in zip(sites, depths, start_depths):
+            pt, normal, jp, jn = hand.point_jac(c, palm, q)
+            preload = (1 - phase) * start + phase * depth
+            target = c["goal"] - preload * c["normal"]
+            target[2] = max(target[2], table + 0.0015)
+            w = c["weight"]
+            jac.extend([w * jp[:, 6:], w * 0.004 * jn[:, 6:]])
+            error.extend([w * (target - pt), w * 0.004 * (-c["normal"] - normal)])
+        jac = np.vstack(jac)
+        # Damped differential IK, with a weak postural prior for underconstrained joints.
+        gram = jac.T @ jac
+        delta = np.linalg.solve(
+            gram + 0.000035 * np.eye(len(q)),
+            jac.T @ np.concatenate(error) + 0.000002 * (initial - q),
+        )
+        q = np.clip(q + np.clip(delta, -0.075, 0.075), *limits.T)
+        path.append(q.copy())
+    for c in sites:
+        pt = hand.point_jac(c, palm, q)[0]
+        gaps[c["link"]] = round(float((pt - c["goal"]) @ c["normal"]), 5)
+    return np.asarray(path), dict(zip([c["link"] for c in sites], depths)), gaps
+
+
+def carry_shape(hand, palm, seated, contacts, limits, table):
+    """Curl the opposed fingertips under the object as the table clears on the probe."""
+    supports = []
+    for c in contacts:
+        goal = c["goal"].copy()
+        if c["link"].endswith("elastomer"):
+            width = c.get("section_width", 0.04)
+            inward = c["normal"].copy()
+            inward[2] = 0
+            goal -= np.clip(0.12 * width, 0.0015, 0.0040) * inward
+            goal[2] -= np.clip(0.15 * width, 0.002, 0.0045)
+        supports.append(dict(c, goal=goal))
+    path, _, _ = closure_path(hand, palm, seated, supports, limits, table - 0.022)
+    return path[-1]
+
+
+def close_from_mesh(controller, contacts):
+    io = controller.io
+    path, depths, gaps = closure_path(
+        controller.hand_contacts,
+        controller.ik.fk(controller.arm),
+        controller.hand,
+        contacts,
+        io.model.limits["right"],
+        controller.table,
     )
+    controller.event(
+        "planned_mesh_closure",
+        q_start=path[0].tolist(),
+        q_end=path[-1].tolist(),
+        normal_preload_m=depths,
+        predicted_signed_gap_m=gaps,
+        path_q=path.tolist(),
+    )
+    ticks = max(2, round(0.055 / io.dt))
+    for a, b in itertools.pairwise(path):
+        for t in np.arange(1, ticks + 1) / ticks:
+            io.step(controller.arm, a + t * (b - a))
+    controller.hand = path[-1].copy()

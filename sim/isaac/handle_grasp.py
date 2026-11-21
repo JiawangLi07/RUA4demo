@@ -141,9 +141,10 @@ def handle_grasps(trial, coarse):
     card = np.asarray(library[name])
     if not hasattr(trial, "tool_library"):
         trial.tool_library = {}
-    if name not in trial.tool_library:
-        trial.tool_library[name] = _hand_library(scene, card)
-    pool = trial.tool_library[name]
+    key = (name, tuple(card))
+    if key not in trial.tool_library:
+        trial.tool_library[key] = _hand_library(scene, card)
+    pool = trial.tool_library[key]
     rows = []
     for sign in (1, -1):
         a, n = sign * np.r_[axis, 0], sign * np.r_[normal, 0]

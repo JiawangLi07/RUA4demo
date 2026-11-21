@@ -2,6 +2,7 @@
 
 import argparse
 import gzip
+import itertools
 import json
 from pathlib import Path
 
@@ -39,8 +40,12 @@ def geometry_family(surface):
     if long > 0.090 and long > 2.5 * max(narrow, high):
         t = (points[:, :2] - points[:, :2].mean(0)) @ axes[:, -1]
         widths = []
-        for band in np.array_split(np.argsort(t), 16):
-            if len(band) > 5:
+        # A thick handle may have many more triangles than its narrow shaft.
+        # Equal-length sections preserve the shaft in the width profile.
+        edges = np.linspace(*np.quantile(t, [0.004, 0.996]), 17)
+        for lo, hi in itertools.pairwise(edges):
+            band = (t >= lo) & (t < hi)
+            if np.count_nonzero(band) > 5:
                 widths.append(
                     np.ptp(np.quantile(points[band, :2] @ axes[:, 0], [0.04, 0.96]))
                 )

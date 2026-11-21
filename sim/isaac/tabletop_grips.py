@@ -36,6 +36,7 @@ def wrap_candidates(controller, surface, seeds, used, others):
         cfg={
             "pinch_postures": {n: seeds[n]["q_touch"] for n in names},
             "wrap_postures": names,
+            "fit_finite_surface": True,
         },
     )
     result = []
@@ -43,6 +44,18 @@ def wrap_candidates(controller, surface, seeds, used, others):
         if not controller.clear(g.pre, g.opened, others) or not controller.clear(
             g.close, g.closed, others
         ):
+            continue
+        # Several top surface fits can lie outside the same arm branch. Apply
+        # the candidate budget only after finding reachable palm/approach pairs.
+        for initial in (controller.arm, controller.mid_arm):
+            try:
+                approach_joints = controller.ik.solve(g.pre, initial)
+                controller.ik.solve(g.close, approach_joints)
+            except ValueError:
+                continue
+            controller.hints[g.pre.round(5).tobytes()] = approach_joints
+            break
+        else:
             continue
         card = dict(
             seeds[g.details["posture"]],
@@ -57,7 +70,7 @@ def wrap_candidates(controller, surface, seeds, used, others):
                 g.details["yaw_deg"],
             )
         )
-        if len(result) == 5:
+        if len(result) == 10:
             break
     return result
 

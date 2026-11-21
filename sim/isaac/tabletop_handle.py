@@ -1,16 +1,37 @@
-"""Refit each finger to the observed thick handle with wrist RGB-D and encoders."""
+"""Refit each finger to the observed thick handle using wrist RGB-D and the hand kinematic model."""
 
 from copy import copy
 from types import SimpleNamespace
 
 import numpy as np
+from scipy.spatial import ConvexHull
 
 from .handle_grasp import TOOL_GRASPS, handle_grasps, handle_sections
 from .head_wrist_trial import FINGERS, PALM, Rejected
 from .tabletop_vision import wrist_points
 
 
+def volume_center(parts):
+    """Uniform-density first moment of the registered convex mesh components."""
+    centers, volumes = [], []
+    for vertices in parts:
+        origin = vertices.mean(0)
+        faces = vertices[ConvexHull(vertices).simplices]
+        volume = np.abs(
+            np.einsum(
+                "ij,ij->i",
+                faces[:, 0] - origin,
+                np.cross(faces[:, 1] - origin, faces[:, 2] - origin),
+            )
+        )
+        centers.extend((faces.sum(1) + origin) / 4)
+        volumes.extend(volume)
+    return np.average(centers, weights=volumes, axis=0)
+
+
 def plan(controller, surface, used, others, cards):
+    from .tabletop_meshfit import gravity_residual
+
     surface = copy(surface)
     surface.world = getattr(surface, "handle_world", surface.world)
     context = SimpleNamespace(
@@ -25,6 +46,9 @@ def plan(controller, surface, used, others, cards):
         },
         used_postures=set(used),
     )
+    center = volume_center(surface.world_parts)
+    envelope = (surface.world.min(0) + surface.world.max(0)) / 2
+    pool = []
     for name in TOOL_GRASPS:
         if name in used or name not in cards:
             continue
@@ -39,34 +63,58 @@ def plan(controller, surface, used, others, cards):
                 g.close, g.closed, others
             ):
                 continue
-            for initial in (
-                controller.arm,
-                controller.mid_arm,
-                controller.reference_arm,
-            ):
-                try:
-                    q = controller.ik.solve(g.pre, initial)
-                    controller.ik.solve(g.close, q)
-                except ValueError:
-                    continue
-                controller.hints[g.pre.round(5).tobytes()] = q
-                seed = {
-                    "posture": name,
-                    "origin": "wrist_handle_cross_sections",
-                    "q_open": g.opened,
-                    "q_touch": g.closed,
-                    "q_tight": g.closed,
-                }
-                controller.event(
-                    "handle_plan",
-                    posture=name,
-                    **{
-                        k: v
-                        for k, v in g.details.items()
-                        if k.startswith("handle_") or k in ("tilt_deg", "patch_world_m")
-                    },
+            sites = handle_sites(controller.hand_contacts, surface, g.close, g.closed)
+            contacts = np.array([c["goal"] for c in sites])
+            # The thumb balances the combined load of the opposing fingers.
+            midpoint = (contacts[0] + contacts[1:].mean(0)) / 2
+            axis = np.asarray(g.details["handle_axis_xy"])
+            lever = max(abs((midpoint[:2] - c[:2]) @ axis) for c in (center, envelope))
+            gaps = [
+                np.linalg.norm(
+                    controller.hand_contacts.point_jac(c, g.close, g.closed)[0]
+                    - c["goal"]
                 )
-                return seed, {"pre": g.pre, "grasp": g.close, "tight": g.close}, 0
+                for c in sites
+            ]
+            wrench = gravity_residual(sites, center)
+            quality = lever + 0.035 * wrench + 0.45 * (gaps[0] + np.mean(gaps[1:]))
+            pool.append((quality, lever, wrench, name, g))
+    for _, lever, wrench, name, g in sorted(pool, key=lambda row: row[0]):
+        for initial in (
+            controller.arm,
+            controller.mid_arm,
+            controller.reference_arm,
+        ):
+            try:
+                q = controller.ik.solve(g.pre, initial)
+                controller.lift_ik(g.close, q)
+            except ValueError:
+                continue
+            controller.hints[g.pre.round(5).tobytes()] = q
+            seed = {
+                "posture": name,
+                "origin": "wrist_handle_cross_sections",
+                "q_open": g.opened,
+                "q_touch": g.closed,
+                "q_tight": g.closed,
+            }
+            controller.event(
+                "handle_plan",
+                posture=name,
+                pregrasp_palm=g.pre.tolist(),
+                palm=g.close.tolist(),
+                q_open=g.opened.tolist(),
+                q_target=g.closed.tolist(),
+                uniform_density_center_m=center.tolist(),
+                axial_balance_error_m=round(float(lever), 5),
+                wrench_residual=round(float(wrench), 5),
+                **{
+                    k: v
+                    for k, v in g.details.items()
+                    if k.startswith("handle_") or k in ("tilt_deg", "patch_world_m")
+                },
+            )
+            return seed, {"pre": g.pre, "grasp": g.close, "tight": g.close}, 0
     return None
 
 
@@ -104,78 +152,77 @@ def reobserve(controller, surface, pose, tag="handle_seated"):
 
 
 def seat(controller, surface, pose, closed):
-    io = controller.io
-    names = io.model.hand_names["right"]
-    joints = {
-        d: [i for i, n in enumerate(names) if n.startswith("right_" + d + "_")]
-        for d in FINGERS
-    }
-    lo, hi = io.model.limits["right"].T
-    # Preserve the fresh closure target while the table-supported handle settles.
+    from .tabletop_meshfit import close_from_mesh
+
     controller.hold(0.10)
     surface, pose = reobserve(controller, surface, pose)
+    contacts = handle_sites(
+        controller.hand_contacts, surface, controller.ik.fk(controller.arm), closed
+    )
+    controller.event(
+        "handle_surface_targets",
+        targets={
+            c["link"]: {
+                "point_m": c["goal"].tolist(),
+                "normal": c["normal"].tolist(),
+                "local_width_m": float(c["section_width"]),
+            }
+            for c in contacts
+        },
+    )
+    close_from_mesh(controller, contacts)
+    updated, new_pose = reobserve(controller, surface, pose, tag="before_probe")
+    movement = new_pose @ np.linalg.inv(pose)
+    for site in contacts:
+        site["goal"] = movement[:3, :3] @ site["goal"] + movement[:3, 3]
+        site["normal"] = movement[:3, :3] @ site["normal"]
+    if np.linalg.norm(new_pose[:3, 3] - pose[:3, 3]) >= 0.002:
+        close_from_mesh(controller, contacts)
+    return updated, new_pose, contacts
+
+
+def handle_sites(hand, surface, palm, closed):
+    """Assign individual pads to the two sides of locally fitted handle cross-sections."""
+    from .tabletop_meshfit import unit
+
     origin, axis, normal, sections = handle_sections(
         getattr(surface, "handle_world", surface.world)
     )
     along, across = np.r_[axis, 0.0], np.r_[normal, 0.0]
     base = np.r_[origin, 0.0]
-    palm = io.fk(PALM)
     sign = np.sign(palm[:2, 2] @ normal) or 1.0
-    controller.event("seat_handle_encoders")
-    stable = 0
-    for iteration in range(23):
-        measured = io.q()
-        state = dict(zip(io.names, measured))
-        actual = measured[io.hand]
-        hand = controller.hand.copy()
-        target = hand.copy()
-        gaps = {}
-        deflection = {}
-        for d, ids in joints.items():
-            outward = sign * (-1 if d == "thumb" else 1)
-            link = "right_" + d + "_elastomer"
-            t = io.tree.pose(link, state)
-            local = io.model.hand_support[link]
-            inner = np.argsort(outward * (local @ (t[:3, :3].T @ across)))[:8]
-            anchor = local[inner].mean(0)
-            point = t[:3, :3] @ anchor + t[:3, 3]
-            station = np.clip(
-                along @ (point - base), sections[0, 0] + 0.004, sections[-1, 0] - 0.004
-            )
-            u, z, radius, half = [
-                np.interp(station, sections[:, 0], sections[:, k]) for k in (1, 2, 3, 4)
-            ]
-            below = min(0.005, 0.24 * half)
-            radius *= np.sqrt(1 - (below / half) ** 2)
-            gaps[d] = float(outward * ((point - base) @ across - u) - radius)
-            depth = min(0.010, 0.0025 + iteration * 0.00065)
-            goal = base + station * along + (u + outward * (radius - depth)) * across
-            goal[2] = z - below
-            jac = []
-            for j in ids:
-                altered = dict(state)
-                altered[names[j]] += 0.001
-                ti = io.tree.pose(link, altered)
-                jac.append((ti[:3, :3] @ anchor + ti[:3, 3] - point) / 0.001)
-            jac = np.array(jac).T
-            dq = jac.T @ np.linalg.solve(
-                jac @ jac.T + 0.000055 * np.eye(3), goal - point
-            )
-            target[ids] += np.clip(actual[ids] + dq - hand[ids], -0.095, 0.095)
-            flex = [j for j in ids if names[j].endswith(("_FE", "PIP", "DIP", "_IP"))]
-            deflection[d] = float(np.max(np.abs(hand[flex] - actual[flex])))
-        target = np.clip(target, lo, hi)
-        for k in range(1, 17):
-            io.step(controller.arm, hand + (target - hand) * k / 16.0)
-        controller.hand = target
-        loaded = [d for d in FINGERS if deflection[d] > 0.042 and abs(gaps[d]) < 0.010]
-        stable = stable + 1 if "thumb" in loaded and len(loaded) >= 3 else 0
-        if iteration >= 10 and stable >= 3:
-            break
-    controller.event(
-        "handle_encoder_readback",
-        pad_gap_m={d: round(g, 4) for d, g in gaps.items()},
-        joint_deflection_rad={d: round(g, 4) for d, g in deflection.items()},
-        candidate_digits=loaded,
-    )
-    return reobserve(controller, surface, pose)
+    contacts = []
+    for digit in FINGERS:
+        outward = sign * (-1 if digit == "thumb" else 1)
+        link = "right_" + digit + "_elastomer"
+        frame, _ = hand.link(link, palm, closed)
+        vertices = hand.io.model.hand_support[link]
+        inner = np.argsort(outward * (vertices @ (frame[:3, :3].T @ across)))[:8]
+        anchor = vertices[inner].mean(0)
+        point = frame[:3, :3] @ anchor + frame[:3, 3]
+        station = np.clip(
+            along @ (point - base), sections[0, 0] + 0.004, sections[-1, 0] - 0.004
+        )
+        lateral, z, radius, half_height = [
+            np.interp(station, sections[:, 0], sections[:, k]) for k in (1, 2, 3, 4)
+        ]
+        below = min(0.005, 0.24 * half_height)
+        side = radius * np.sqrt(1 - (below / half_height) ** 2)
+        goal = base + station * along + (lateral + outward * side) * across
+        goal[2] = z - below
+        normal_world = unit(
+            outward * side / radius**2 * across
+            - np.array([0, 0, below / half_height**2])
+        )
+        contacts.append(
+            {
+                "link": link,
+                "anchor": anchor,
+                "hand_normal": unit(anchor - vertices.mean(0)),
+                "goal": goal,
+                "normal": normal_world,
+                "section_width": 2 * side,
+                "weight": 1.35 if digit == "thumb" else 1.0,
+            }
+        )
+    return contacts

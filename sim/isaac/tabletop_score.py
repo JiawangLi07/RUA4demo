@@ -82,6 +82,8 @@ def evaluate(scene, directory, lift_height=None):
                 "closure_requested": close_time is not None,
                 "wrist_refined": "registered_wrist" in phases,
                 "stable": False,
+                "raised": False,
+                "held_through_end": False,
                 "start_s": round((first + 1) * dt, 3),
                 "end_s": round((last + 1) * dt, 3),
             }
@@ -105,6 +107,18 @@ def evaluate(scene, directory, lift_height=None):
                 b = bottom[sl, target]
                 load = forces[sl, target]
                 rise = t[:, 2] - t[0, 2]
+                if "hold_start" in phases and "hold_end" in phases:
+                    u = tick(phases["hold_start"]["time"]) - a
+                    v = tick(phases["hold_end"]["time"]) - a
+                    row.update(
+                        hold_phase_s=round(float((v - u) * dt), 4),
+                        hold_phase_minimum_rise_m=round(
+                            float(rise[u : v + 1].min()), 5
+                        ),
+                        hold_phase_minimum_clearance_m=round(
+                            float(b[u : v + 1].min()), 5
+                        ),
+                    )
                 row.update(
                     posture=phases["close"]["posture"],
                     peak_rise_m=round(float(rise.max()), 4),
@@ -119,6 +133,7 @@ def evaluate(scene, directory, lift_height=None):
                     if n != physical_name and x > 0.02
                 }
                 met = (rise >= lift_height) & (b >= lift_height)
+                row["raised"] = bool(np.any(met))
                 spans = np.flatnonzero(
                     np.diff(np.r_[False, met, False].astype(int))
                 ).reshape(-1, 2)
@@ -131,6 +146,22 @@ def evaluate(scene, directory, lift_height=None):
                 rr = Rotation.from_quat(t[:, [4, 5, 6, 3]])
                 local = pr.inv().apply(t[:, :3] - p[:, :3])
                 rotation = pr.inv() * rr
+                if "hold_phase_s" in row:
+                    stop = tick(phases["hold_end"]["time"]) - a + 1
+                    start = stop - window
+                    if (
+                        start >= tick(phases["hold_start"]["time"]) - a
+                        and met[start:stop].all()
+                    ):
+                        drift = np.linalg.norm(local[start:stop] - local[start], axis=1)
+                        angle = (
+                            rotation[start].inv() * rotation[start:stop]
+                        ).magnitude()
+                        row["held_through_end"] = bool(
+                            np.mean(load[start:stop] > 0.05) >= 0.9
+                            and drift.max() <= 0.03
+                            and angle.max() <= 0.5
+                        )
                 for u, v in spans:
                     for start in range(u, v - window + 1):
                         stop = start + window
@@ -200,6 +231,10 @@ def evaluate(scene, directory, lift_height=None):
             for rows in scores.values()
         ),
         "stable": sum(any(r["stable"] for r in rows) for rows in scores.values()),
+        "raised": sum(any(r["raised"] for r in rows) for rows in scores.values()),
+        "held_through_end": sum(
+            any(r["held_through_end"] for r in rows) for rows in scores.values()
+        ),
         "visual_pass": sum(
             any(r["online"] == "vision_pass" for r in rows) for rows in scores.values()
         ),

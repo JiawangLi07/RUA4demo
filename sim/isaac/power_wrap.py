@@ -145,17 +145,17 @@ def hand_fits(scene, name, card, radius, cant, roll):
         xz[i],
         qo,
         q,
-        dict(
-            posture=name,
-            power_wrap=True,
-            palm_gap_m=float(palm[i]),
-            thumb_gap_m=float(data["thumb"][1][i]),
-            proximal_gap_m=float(min(data[d][0][i] for d in FINGERS[1:])),
-            finger_gaps_m=[float(data[d][1][i]) for d in FINGERS[1:]],
-            axis_cant_deg=cant,
-            axis_roll_deg=roll,
-            metacarpal_gaps_m={d: float(v[i]) for d, v in base_gaps.items()},
-        ),
+        {
+            "posture": name,
+            "power_wrap": True,
+            "palm_gap_m": float(palm[i]),
+            "thumb_gap_m": float(data["thumb"][1][i]),
+            "proximal_gap_m": float(min(data[d][0][i] for d in FINGERS[1:])),
+            "finger_gaps_m": [float(data[d][1][i]) for d in FINGERS[1:]],
+            "axis_cant_deg": cant,
+            "axis_roll_deg": roll,
+            "metacarpal_gaps_m": {d: float(v[i]) for d, v in base_gaps.items()},
+        },
     )
 
 
@@ -180,7 +180,7 @@ def wrap_grasps(trial, coarse):
             continue
         cant = int(trial.cfg.get("wrap_cant_deg", 26))
         roll = int(trial.cfg.get("wrap_roll_deg", 23))
-        key = (name, round(radius, 3), cant, roll)
+        key = (name, round(radius, 3), cant, roll, np.asarray(library[name], dtype=float).tobytes())
         if key not in cache:
             cache[key] = hand_fits(trial.scene, name, library[name], key[1], cant, roll)
         cost, (cx, cz), opened, closed, meta = cache[key]

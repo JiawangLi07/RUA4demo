@@ -10,6 +10,27 @@ from scipy.spatial.transform import Rotation
 
 from .scene_meshes import load_mesh_bundle
 
+PARK_ARMS = {
+    "L": [
+        -1.290963836,
+        1.299714337,
+        1.527006662,
+        -1.882286094,
+        -1.840669591,
+        -0.088832653,
+        -1.538807605,
+    ],
+    "R": [
+        1.377736218,
+        1.222414972,
+        -1.691926096,
+        -1.842133491,
+        1.881570539,
+        -0.155392425,
+        1.545743866,
+    ],
+}
+
 
 def separate(a, b, gap):
     for poly in (a, b):
@@ -75,29 +96,9 @@ def make_scene(base, objects, seed):
     result["tabletop_seed"] = seed
     # In the station frame +X points toward the table, +Y toward the left arm.
     # The named postures put the palms at x=.24, y=+/-.31, z=.95 with fingers up.
-    arms = {
-        "L": [
-            -1.290963836,
-            1.299714337,
-            1.527006662,
-            -1.882286094,
-            -1.840669591,
-            -0.088832653,
-            -1.538807605,
-        ],
-        "R": [
-            1.377736218,
-            1.222414972,
-            -1.691926096,
-            -1.842133491,
-            1.881570539,
-            -0.155392425,
-            1.545743866,
-        ],
-    }
     result["initial_joint_positions"] = {
         f"Joint{i}_{side}": angle
-        for side, angles in arms.items()
+        for side, angles in PARK_ARMS.items()
         for i, angle in enumerate(angles, 1)
     }
     result["head_wrist_validation"] = {

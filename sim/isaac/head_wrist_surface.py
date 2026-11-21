@@ -81,6 +81,22 @@ class RegisteredSurface:
             raise ValueError(f"mesh-to-depth fit rejected: median {median:.4f} m, p90 {p90:.4f} m")
         self.fit = q
         rot, shift = pose(q)
+        self.place(rot, shift, table)
+        center = (self.world.min(0) + self.world.max(0)) / 2
+        return {
+            "center": center.tolist(),
+            "radius_m": float(np.max(np.ptp(self.world[:, :2], axis=0)) / 2),
+            "top_m": float(self.world[:, 2].max()),
+            "median_residual_m": median,
+            "p90_residual_m": p90,
+            "pose_world_translation_m": shift.tolist(),
+            "pose_world_rotation": rot.tolist(),
+            "upright_local_bottom_m": float(zlo),
+            "fit_samples": len(points),
+        }
+
+    def place(self, rot, shift, table):
+        """Express this metric prior and its convex supports in a known table frame."""
         self.world = self.local @ rot.T + shift
         self.world_parts = [p @ rot.T + shift for p in self.parts]
         # Slab directions for conservative whole-object approach checks, including distinct colliders.
@@ -94,18 +110,6 @@ class RegisteredSurface:
             proj = part @ self.directions.T
             self.bounds.append((part.min(0), part.max(0), proj.min(0), proj.max(0)))
         self.table = table
-        center = (self.world.min(0) + self.world.max(0)) / 2
-        return {
-            "center": center.tolist(),
-            "radius_m": float(np.max(np.ptp(self.world[:, :2], axis=0)) / 2),
-            "top_m": float(self.world[:, 2].max()),
-            "median_residual_m": median,
-            "p90_residual_m": p90,
-            "pose_world_translation_m": shift.tolist(),
-            "pose_world_rotation": rot.tolist(),
-            "upright_local_bottom_m": float(zlo),
-            "fit_samples": len(points),
-        }
 
     def clear(self, shapes, pose, margin):
         for v in shapes.values():

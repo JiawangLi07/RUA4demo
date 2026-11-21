@@ -229,7 +229,7 @@ def match_height(frame, io, table, model_points, resting, held, reference_color)
     if len(pts) > 2200:
         pts = pts[:: int(np.ceil(len(pts) / 2200))]
     d0 = cKDTree(ref0).query(pts)[0]
-    d1 = cKDTree(ref1).query(pts)[0]
+    d1, near1 = cKDTree(ref1).query(pts)
     eligible = np.minimum(d0, d1) < 0.010
     # Only pixels that distinguish the hypotheses vote. A vertical cylinder wall alone is ambiguous.
     wins0 = np.count_nonzero(eligible & (d0 + 0.003 < d1))
@@ -241,6 +241,30 @@ def match_height(frame, io, table, model_points, resting, held, reference_color)
         vote = "on_table"
     evidence = {}
     displacement = held[:3, 3] - resting[:3, 3]
+    # One moving end of a long tool can resemble the raised template while
+    # its other end still rests on the table. Require spatially separated
+    # matches near the estimated bottom for a geometric height witness.
+    if displacement[2] > 0.035:
+        matches = (d1 < 0.005) & (d1 + 0.003 < d0)
+        if matches.sum() >= 18:
+            _, _, axes = np.linalg.svd(ref1 - ref1.mean(0), full_matrices=False)
+            coord = ref1 @ axes[0]
+            low, high = np.quantile(coord, [0.015, 0.985])
+            sample = coord[near1[matches]]
+            cover = np.quantile(sample, [0.06, 0.94])
+            lower_band = ref1[near1[matches], 2] < ref1[:, 2].min() + max(
+                0.005, 0.16 * np.ptp(ref1[:, 2])
+            )
+            if (
+                cover[0] <= low + 0.26 * (high - low)
+                and cover[1] >= high - 0.26 * (high - low)
+                and lower_band.sum() >= 4
+            ):
+                dz = np.median((pts[matches, 2] - ref1[near1[matches], 2])[lower_band])
+                evidence["geometry_clearance_m"] = round(
+                    float(ref1[:, 2].min() - table + dz), 5
+                )
+                evidence["geometry_rise_m"] = round(float(displacement[2] + dz), 5)
     if 0.010 < displacement[2] < 0.042:
         # A compliant grasp can take up clearance before the object starts moving.
         # Estimate continuous visible object motion during the small verification lift.

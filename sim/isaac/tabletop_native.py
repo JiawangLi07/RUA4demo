@@ -51,7 +51,7 @@ def main():
             json.loads(args.scene.read_bytes()), out, args.device
         )
         io, audit = connect(scene, out)
-        home = io.q()
+        home = io.commanded_joints()
         for _ in range(round(1.5 / io.dt)):
             io.step(home[io.arm], home[io.hand])
         head = io.camera("head")
@@ -67,7 +67,13 @@ def main():
                     parser.error("--library is required for a grasp trial")
                 spec, shared = load_registry(args.library, args.template_comparison)
                 (out / "trial_settings.json").write_text(
-                    json.dumps({"lift_height_m": args.lift_height_m})
+                    json.dumps(
+                        {
+                            "lift_height_m": args.lift_height_m,
+                            "grasp_inputs": "rgbd_mesh_commanded_kinematics",
+                            "joint_observation": "issued_targets",
+                        }
+                    )
                 )
                 run(
                     io,
