@@ -168,7 +168,7 @@ def wrap_grasps(trial, coarse):
     center = (a + b) / 2
     radius = float(np.mean(b - a) / 2)
     library = trial.cfg["pinch_postures"]
-    choices = ["3_Medium_Wrap", "1_Large_Diameter", "2_Small_Diameter", "30_Palmar"]
+    choices = trial.cfg.get("wrap_postures", ("3_Medium_Wrap", "1_Large_Diameter", "2_Small_Diameter", "30_Palmar"))
     if coarse is not None:
         choices = [coarse.details["posture"]]
     cache = getattr(trial, "wrap_fit_cache", {})
@@ -433,7 +433,10 @@ def close_envelope(trial, goal, closed, limit):
 
     def supported(row):
         links = row["link_normal_N"]
-        return envelope_contacts(links) or (probe and phalangeal_support(links))
+        # A supported phalangeal seat may start the 2 cm probe. Check actual palm
+        # loading at the top of that probe before committing to the full lift.
+        allow_finger_support = probe and not trial.cfg.get("require_palm_hold")
+        return envelope_contacts(links) or (allow_finger_support and phalangeal_support(links))
 
     trial.lift_and_hold(trial.palm(), tight, supported, maintain_preload=True)
     held = trial.samples[-round(2 / trial.dt) :]
@@ -478,6 +481,7 @@ def seat_with_tactile(trial, goal, arm, hand, row):
     origin = goal[:3, 3] + goal[:3, :3] @ offset
     centre = origin.copy()
     initial = trial.palm()
+    seat_reference = hand.copy()
     commanded = initial.copy()
     names = scene.hand_names["right"]
     ids = {d: [j for j, n in enumerate(names) if n.startswith("right_" + d + "_")] for d in FINGERS}
@@ -529,6 +533,8 @@ def seat_with_tactile(trial, goal, arm, hand, row):
             w = tick / 16
             qarm = arm + w * (joints[-1] - arm)
             loads = row["link_normal_N"]
+            if trial.cfg.get("require_palm_hold"):
+                trial.share_thumb_load(hand, seat_reference, loads)
             for d, indexes in ids.items():
                 digit_load = sum(
                     loads.get("right_" + d + "_" + k, 0) for k in ("PP", "MP", "DP", "elastomer", "MC")

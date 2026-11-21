@@ -59,6 +59,8 @@ class RetryGrasp(DirectGrasp):
         return super().options(role, coarse)
 
     def close_and_lift(self, grasp, qcontact, qclose, low, hi):
+        if self.cfg.get("require_palm_hold") and not self.selected_grasp.details.get("power_wrap"):
+            raise Rejected("this attempt requires distributed palm contact")
         if self.selected_grasp.details.get("tool_handle"):
             from .handle_grasp import close_handle
 

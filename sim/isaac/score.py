@@ -84,6 +84,12 @@ def score(directory):
             raise ValueError(f"hold lacks measured multi-finger opposition on the handle: {spatial}")
     elif grip.get("power_wrap"):
         summary["envelope_steps"] = sum(envelope_contacts(r["link_normal_N"]) for r in hold)
+    if (
+        result["passed"]
+        and config.get("head_wrist_validation", {}).get("require_palm_hold")
+        and summary.get("envelope_steps", 0) != required_steps
+    ):
+        raise ValueError("the required central palm and proximal finger loads did not persist throughout the hold")
     return summary
 
 

@@ -360,13 +360,28 @@ class HeadWristTrial:
 
         self.lift_and_hold(grasp, tight, lambda row: self.bilateral(row["pad_contacts"]))
 
+    def share_thumb_load(self, hand, reference, links):
+        if (
+            not self.cfg.get("share_palm_load")
+            or links.get(PALM, 0) >= 1.2
+            or links.get("right_thumb_MC", 0) <= 5
+        ):
+            return
+        # Let the broad palm approach while keeping the opposing thumb pad engaged.
+        for j in self.digit_indices["thumb"]:
+            name = self.scene.hand_names["right"][j]
+            if name.endswith("CMC_FE"):
+                hand[j] = max(reference[j] - 0.40, hand[j] - 0.65 * self.dt)
+            elif name.endswith("MCP_FE") and links.get("right_thumb_elastomer", 0) < 2.5:
+                hand[j] = min(reference[j] + 0.40, hand[j] + 0.42 * self.dt)
+
     def regulate_loaded_fingers(self, hand):
         if not self.cfg.get("regulate_power_lift"):
             return
         nominal = self.loaded_hand_reference
         links = self.samples[-1]["link_normal_N"]
         palm = links.get(PALM, 0.0)
-        share = self.cfg.get("share_palm_load") and palm < 1.2 and links.get("right_thumb_MC", 0) > 5
+        self.share_thumb_load(hand, nominal, links)
         names = self.scene.hand_names["right"]
         for digit, ids in self.digit_indices.items():
             force = sum(v for k, v in links.items() if k.startswith("right_" + digit + "_"))
@@ -374,12 +389,7 @@ class HeadWristTrial:
             for j in ids:
                 name = names[j]
                 if digit == "thumb":
-                    if share and name.endswith("CMC_FE"):
-                        # Open the base to make room for the broad palm while the thumb pad opposes.
-                        hand[j] = max(nominal[j] - 0.40, hand[j] - 0.65 * self.dt)
-                    elif share and name.endswith("MCP_FE") and links.get("right_thumb_elastomer", 0) < 2.5:
-                        hand[j] += 0.42 * self.dt
-                    elif force < 1.8 and name.endswith(("CMC_FE", "MCP_FE", "_IP")):
+                    if force < 1.8 and name.endswith(("CMC_FE", "MCP_FE", "_IP")):
                         hand[j] += 0.42 * self.dt
                 elif name.endswith("MCP_FE") and proximal < 0.65 and force < 5.5:
                     hand[j] += 0.54 * self.dt
