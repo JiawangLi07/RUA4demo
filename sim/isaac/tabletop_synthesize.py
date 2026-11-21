@@ -16,7 +16,7 @@ from .scene_fixture import rigid_transform
 from .scene_kinematics import KinematicTree
 from .tabletop_catalog import load_registry
 from .tabletop_control import Controller, NoPath
-from .tabletop_handle import handle_sites
+from .tabletop_handle import approach_contacts, handle_sites
 from .tabletop_layout import PARK_ARMS
 from .tabletop_meshfit import carry_shape, closure_path
 from .tabletop_vision import add_live_samples
@@ -73,19 +73,33 @@ def synthesize(planner, name, surface, pose, obstacles=None, previous=()):
     card, poses = planner.fit_registered(
         name, family, surface, pose, seeds, previous, others
     )
-    q = np.asarray(card["q_touch"])
+    q_touch = np.asarray(card["q_touch"])
+    q = q_touch
+    hand = planner.hand_contacts
+    palm = poses["grasp"]
+    limits = planner.io.model.limits["right"]
+    approach = {}
     if card["origin"] == "wrist_handle_cross_sections":
-        sites = handle_sites(planner.hand_contacts, surface, poses["grasp"], q)
+        sites = handle_sites(hand, surface, palm, q_touch)
+        knots = approach_contacts(
+            hand,
+            poses["pre"],
+            palm,
+            np.asarray(card["q_open"]),
+            q_touch,
+            sites,
+            limits,
+            surface.table,
+        )
+        approach = {
+            "palm_approach_path": [p.tolist() for p, _ in knots],
+            "q_approach_path": [a.tolist() for _, a in knots],
+        }
+        q = knots[-1][1]
+        sites = handle_sites(hand, surface, palm, q)
     else:
         sites = card["fit_sites"]
-    path, depth, gaps = closure_path(
-        planner.hand_contacts,
-        poses["grasp"],
-        q,
-        sites,
-        planner.io.model.limits["right"],
-        surface.table,
-    )
+    path, depth, gaps = closure_path(hand, palm, q, sites, limits, surface.table)
     return {
         "object": name,
         "frame": "station",
@@ -98,15 +112,11 @@ def synthesize(planner, name, surface, pose, obstacles=None, previous=()):
         "palm_pre": poses["pre"].tolist(),
         "palm_grasp": poses["grasp"].tolist(),
         "q_open": np.asarray(card["q_open"]).tolist(),
-        "q_touch": q.tolist(),
+        "q_touch": q_touch.tolist(),
+        **approach,
         "q_seated": path[-1].tolist(),
         "q_hold": carry_shape(
-            planner.hand_contacts,
-            poses["grasp"],
-            path[-1],
-            sites,
-            planner.io.model.limits["right"],
-            surface.table,
+            hand, palm, path[-1], sites, limits, surface.table
         ).tolist(),
         "q_close_path": path.tolist(),
         "contacts": {

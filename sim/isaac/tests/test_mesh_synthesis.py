@@ -199,6 +199,46 @@ def test_width_sections_detect_a_sparsely_meshed_shaft():
     )
 
 
+def test_handle_pads_approach_opposing_sides_on_the_same_schedule():
+    from sim.isaac.tabletop_handle import approach_contacts
+
+    def point_jac(site, palm, q):
+        i = site["index"]
+        normal = site["normal"]
+        opening = (0.05, 0.035)[i]
+        point = palm[:3, 3] + normal * (opening - 0.04 * q[i])
+        jac = np.zeros((3, 8))
+        jac[:, 6 + i] = -0.04 * normal
+        return point, -normal, jac, np.zeros_like(jac)
+
+    hand = SimpleNamespace(point_jac=point_jac)
+    pre, end = np.eye(4), np.eye(4)
+    pre[:3, 3] = [0.005, 0, 0.075]
+    end[2, 3] = 0.05
+    sites = [
+        {"index": i, "normal": n, "goal": end[:3, 3] + 0.015 * n}
+        for i, n in enumerate(np.array([[-1.0, 0, 0], [1.0, 0, 0]]))
+    ]
+    limits = np.array([[0.0, 1.0], [0.0, 1.0]])
+    opened = np.zeros(2)
+    knots = approach_contacts(
+        hand, pre, end, opened, np.array([0.9, 0.55]), sites, limits, 0.0
+    )
+    np.testing.assert_allclose(knots[0][0], pre)
+    np.testing.assert_allclose(knots[-1][0], end)
+    for site in sites:
+        initial = point_jac(site, pre, opened)[0]
+        goal = site["goal"] - 0.0015 * site["normal"]
+        for (pose, q), t in zip(knots, np.linspace(0, 1, 19), strict=True):
+            fraction = t * t * (3 - 2 * t)
+            np.testing.assert_allclose(
+                point_jac(site, pose, q)[0],
+                initial + fraction * (goal - initial),
+                atol=1e-4,
+            )
+            assert np.all((q >= limits[:, 0]) & (q <= limits[:, 1]))
+
+
 def test_observation_transfer_checks_occupied_space_between_safe_endpoints():
     q0 = np.array([0.0, 0.0])
     q1 = np.array([0.6, 0.1])

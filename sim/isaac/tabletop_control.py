@@ -932,10 +932,10 @@ class Controller:
             close_started = True
             sites = []
             if seed["origin"] == "wrist_handle_cross_sections":
-                from .tabletop_handle import seat
+                from .tabletop_handle import seat, surround_handle
 
-                self.closing(grasp, qt, 0.92)
-                surface, pose, sites = seat(self, surface, pose, qt)
+                surround_handle(self, surface, grasp, qt)
+                surface, pose, sites = seat(self, surface, pose, self.hand)
             elif seed["origin"] == "wrist_mesh_joint_fit":
                 from .tabletop_handle import reobserve
                 from .tabletop_meshfit import close_from_mesh

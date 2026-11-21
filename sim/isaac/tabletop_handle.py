@@ -226,3 +226,67 @@ def handle_sites(hand, surface, palm, closed):
             }
         )
     return contacts
+
+
+def approach_contacts(
+    hand, start_palm, end_palm, q_open, q_touch, sites, limits, table
+):
+    """Move all finger pads from their open CAD positions to the target sides together."""
+    from scipy.spatial.transform import Rotation, Slerp
+
+    rotor = Slerp([0, 1], Rotation.from_matrix([start_palm[:3, :3], end_palm[:3, :3]]))
+    initial = np.array([hand.point_jac(c, start_palm, q_open)[0] for c in sites])
+    goals = np.array([c["goal"] - 0.0015 * c["normal"] for c in sites])
+    goals[:, 2] = np.maximum(goals[:, 2], table + 0.0015)
+    q = q_open.copy()
+    path = [(start_palm.copy(), q.copy())]
+    for fraction in np.linspace(0, 1, 19)[1:]:
+        f = fraction * fraction * (3 - 2 * fraction)
+        palm = end_palm.copy()
+        palm[:3, :3] = rotor(f).as_matrix()
+        palm[:3, 3] = (1 - f) * start_palm[:3, 3] + f * end_palm[:3, 3]
+        targets = (1 - f) * initial + f * goals
+        prior = (1 - f) * q_open + f * q_touch
+        for _ in range(3):
+            j, err = [], []
+            for c, goal in zip(sites, targets):
+                pt, normal, jp, jn = hand.point_jac(c, palm, q)
+                j.extend([jp[:, 6:], 0.003 * f * jn[:, 6:]])
+                err.extend([goal - pt, 0.003 * f * (-c["normal"] - normal)])
+            j = np.vstack(j)
+            step = np.linalg.solve(
+                j.T @ j + 0.000045 * np.eye(len(q)),
+                j.T @ np.concatenate(err) + 0.000005 * (prior - q),
+            )
+            q = np.clip(q + np.clip(step, -0.07, 0.07), *limits.T)
+        path.append((palm, q.copy()))
+    return path
+
+
+def surround_handle(controller, surface, palm, q_touch):
+    hand = controller.hand_contacts
+    sites = handle_sites(hand, surface, palm, q_touch)
+    knots = approach_contacts(
+        hand,
+        controller.ik.fk(controller.arm),
+        palm,
+        controller.hand,
+        q_touch,
+        sites,
+        controller.io.model.limits["right"],
+        controller.table,
+    )
+    arms = [controller.arm.copy()]
+    for pose, _ in knots[1:]:
+        arms.append(controller.ik.solve(pose, arms[-1]))
+    controller.event(
+        "synchronous_handle_approach", q_path=[q.tolist() for _, q in knots]
+    )
+    for i, (_, q_next) in enumerate(knots[1:]):
+        q = knots[i][1]
+        ticks = max(2, round(0.055 / controller.io.dt))
+        for f in np.arange(1, ticks + 1) / ticks:
+            controller.io.step(
+                (1 - f) * arms[i] + f * arms[i + 1], (1 - f) * q + f * q_next
+            )
+    controller.arm, controller.hand = arms[-1].copy(), knots[-1][1].copy()

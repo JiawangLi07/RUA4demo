@@ -49,6 +49,7 @@ PHASES = {
     "handle_reobserved": "复测闭合后的手柄",
     "mesh_reobserved": "复测手指间的物体位置",
     "handle_plan": "从腕部网格拟合多指对握",
+    "synchronous_handle_approach": "拇指和对侧手指同步接近手柄",
     "approach": "接近物体",
     "close": "闭合手指",
     "test_lift": "试提约 2 厘米",
