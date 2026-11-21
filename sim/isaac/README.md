@@ -111,3 +111,24 @@ CPU 回归可运行 `python -m pytest -q sim/isaac/tests`。依赖为 NumPy、Sc
 横放羽毛球也用 `--goal any` 从 36 类中筛出了 22 个相容手形。在同一段原生回合中，指尖捏持和三指手形先后失败，第三次选中 `27_Quadpod` 模式 `unknown-77`。保持期最低抬升 9.68 cm，滑移峰值 3.55 mm。实际承力的是拇指、食指和中指，三指均持续 480 步。对扁盒运行相同的四候选筛选时，没有一个候选通过接触区和路径检查。
 
 在 i9-14900KF 上缓存网格特征和模板后，对每个物体改变世界位姿查询 21 次，瓶子和球筒的中位查询时间分别为 64 ms 和 43 ms。计时包含全部手形排序、模式匹配、三阶段掌体位姿和手指关节角计算。SAM3D 重建、相机配准、机械臂求解和物理执行各自独立计时。
+
+## 随机桌面的双目观测与连续抓取
+
+同一张桌上摆放 14 个独立刚体。每个随机种子重新抽取平面位置和朝向，初始凸包之间至少留 12 mm。羽毛球横放。双臂从后撤的竖掌姿态开始，掌根在工位坐标系的 `(0.24, ±0.31, 0.95)` 米，指尖向上，左右掌相对。第一帧头部相机在这个姿态下曝光。当前由右手执行，左手保持起姿。
+
+控制器从标定的头部 D455 深度图估计桌面，结合前景的尺寸和颜色识别物体。腕部 D405 重新曝光、配准并修正局部网格。候选来自已有 36 类手形目录和先前单件标定，均保存于物体坐标系内。手指闭合使用关节位置回读限制预紧。试提约 2 cm 时，两台相机分别比较物体留在桌面和随手运动这两种预测。通过试提的目标继续抬升并保持 2 s。失败时在物体附近松手、换形或换视角。遮挡、配准失败、路径不可达和闭合后滑脱各自保留在同一段录像及事件记录中。
+
+重放包提供米制资产及 `objects.json`、`library.json`。物理尺寸、质量和摩擦取自该包，运动使用仿真 RGB-D、相机标定、机器人 CAD 与关节回读。每个种子使用一个新的输出目录。
+
+```bash
+export RUA_SIM_ASSETS="/path/to/replay"
+tar -xzf "$RUA_SIM_ASSETS/real2sim_0417.tgz" -C "$RUA_SIM_ASSETS"
+python -m sim.isaac.tabletop_layout --base sim/isaac/config/station.json \
+  --objects "$RUA_SIM_ASSETS/objects.json" --seed 41 --out table41.json
+"$ISAAC_PYTHON" -m sim.isaac.tabletop_native --scene table41.json \
+  --library "$RUA_SIM_ASSETS/library.json" --out runs/table41 --headless --device cuda:0
+OPENBLAS_NUM_THREADS=1 python -m sim.isaac.tabletop_score --scene table41.json --run runs/table41
+python -m sim.isaac.tabletop_video --run runs/table41 --speed 2 --out table41-2x.mp4
+```
+
+`observations/` 保存决策曝光的 RGB、深度、相机内外参和同一时刻的实测关节角。`events.jsonl` 是带时间戳的动作记录。`physics_audit.npz` 由独立记录器保存，评分器在一回合结束后读取。稳定抓取要求指定物体的参考点抬升和碰撞几何最低点离桌均达 9 cm，持续 2 s，期间至少 90% 的时间有手部载荷（>0.05 N），相对手掌的位置漂移不超过 3 cm，旋转漂移不超过 0.5 rad。每次尝试还记录周围物体的位移。仿真相机输出理想深度，当前验证覆盖已有物体先验。

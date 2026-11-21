@@ -75,11 +75,16 @@ class NativeBimanualScene:
         def mapping(key):
             return dict(zip(motors["joint_names"], motors[key][0]))
 
+        initial_joints = initial["joint_positions"].copy()
+        for name, value in config.get("initial_joint_positions", {}).items():
+            if name not in initial_joints or not np.isfinite(value):
+                raise ValueError(f"invalid initial joint position for {name}")
+            initial_joints[name] = float(value)
         self.robot = Articulation(
             ArticulationCfg(
                 prim_path=config["robot_prim"],
                 spawn=None,
-                init_state=ArticulationCfg.InitialStateCfg(joint_pos=initial["joint_positions"]),
+                init_state=ArticulationCfg.InitialStateCfg(joint_pos=initial_joints),
                 actuators={
                     "arm": ImplicitActuatorCfg(
                         joint_names_expr=["Joint[1-7]_.*"],
@@ -117,7 +122,9 @@ class NativeBimanualScene:
         np.testing.assert_allclose(
             np.asarray(UsdGeom.Xformable(camera_prim).GetLocalTransformation()), before, atol=1e-6, rtol=0
         )
-        data_types = ["rgb", "distance_to_image_plane", "instance_id_segmentation_fast"]
+        data_types = ["rgb", "distance_to_image_plane"]
+        if "tabletop_seed" not in config:
+            data_types.append("instance_id_segmentation_fast")
         self.camera = Camera(
             CameraCfg(
                 prim_path=config["camera_prim"],
@@ -178,7 +185,7 @@ class NativeBimanualScene:
             # Independent RGB recording of the contact area, outside the controller inputs.
             observer_path = "/World/DexBridgeObserver"
             prim = UsdGeom.Camera.Define(stage, observer_path)
-            prim.CreateFocalLengthAttr(24.0)
+            prim.CreateFocalLengthAttr(observer.get("focal_length_mm", 24.0))
             prim.CreateHorizontalApertureAttr(20.0)
             prim.CreateClippingRangeAttr((0.025, 8.0))
             standardize_xform_ops(prim.GetPrim())
@@ -230,6 +237,13 @@ class NativeBimanualScene:
                     bounds = collision_bounds(stage, config["robot_prim"] + "/" + name, cache)
                     if bounds is not None:
                         self.hand_bounds[side][name] = bounds
+        self.arm_mask_bounds = {}
+        if "tabletop_seed" in config:
+            for name in self.robot.body_names:
+                if name.startswith(("Link", "TCP_Link", "Base_")) and name.endswith(("_R", "_L")):
+                    bounds = collision_bounds(stage, config["robot_prim"] + "/" + name, cache)
+                    if bounds is not None:
+                        self.arm_mask_bounds[name] = bounds
         self.object_bounds = {
             name: collision_bounds(stage, path, cache) for name, path in config["object_prims"].items()
         }
@@ -261,14 +275,23 @@ class NativeBimanualScene:
         self.time, self.frame_number, self.step_number = 0.0, 0, 0
         self.frames = out / "frames"
         self.frames.mkdir()
+        self.png_options = {"compress_level": 1} if "tabletop_seed" in config else {}
         self.settling_receipt = None
         self.frame_times = []
         self.arm_ids = {
             name: index for index, name in enumerate(self.robot.joint_names) if name.startswith("Joint")
         }
         self.target = self.robot.data.default_joint_pos.clone()
-        self.robot.write_joint_state_to_sim(self.target, torch.zeros_like(self.target))
-        self.robot.reset()
+        if config.get("initial_joint_positions"):
+            self.robot.reset()
+            zero_velocity = torch.zeros_like(self.target)
+            self.robot.write_joint_state_to_sim(self.target, zero_velocity)
+            self.robot.set_joint_position_target(self.target)
+            self.robot.set_joint_velocity_target(zero_velocity)
+            self.robot.write_data_to_sim()
+        else:
+            self.robot.write_joint_state_to_sim(self.target, torch.zeros_like(self.target))
+            self.robot.reset()
         for obj in self.objects.values():
             obj.write_root_state_to_sim(obj.data.default_root_state)
             obj.reset()
@@ -278,6 +301,8 @@ class NativeBimanualScene:
             )
             for side, i in self.palm_ids.items()
         }
+        if config.get("initial_joint_positions"):
+            self.world.forward()
         self._record_initial_state()
         self.capture()
 
@@ -304,11 +329,11 @@ class NativeBimanualScene:
         self.world.render()
         self.camera.update(self.config["physics_dt"], force_recompute=True)
         image = self.camera.data.output["rgb"][0, ..., :3].cpu().numpy()
-        Image.fromarray(image).save(self.frames / f"{self.frame_number:06d}.png")
+        Image.fromarray(image).save(self.frames / f"{self.frame_number:06d}.png", **self.png_options)
         if self.observer_camera is not None:
             self.observer_camera.update(self.config["physics_dt"], force_recompute=True)
             rgb = self.observer_camera.data.output["rgb"][0, ..., :3].cpu().numpy()
-            Image.fromarray(rgb).save(self.out / "observer_frames" / f"{self.frame_number:06d}.png")
+            Image.fromarray(rgb).save(self.out / "observer_frames" / f"{self.frame_number:06d}.png", **self.png_options)
         self.frame_times.append({"frame": self.frame_number, "sim_time": self.time})
         self.frame_number += 1
 
@@ -409,7 +434,7 @@ class NativeBimanualScene:
         )
         return sample
 
-    def _step(self):
+    def advance_dynamics(self):
         self.robot.set_joint_position_target(self.target)
         self.robot.set_joint_velocity_target(torch.zeros_like(self.target))
         self.robot.set_joint_effort_target(
@@ -424,6 +449,9 @@ class NativeBimanualScene:
             obj.update(self.config["physics_dt"])
         self.time += self.config["physics_dt"]
         self.step_number += 1
+
+    def _step(self):
+        self.advance_dynamics()
         sample = self._measure()
         if self.step_number % round(1 / self.config["physics_dt"] / self.config["images"]["fps"]) == 0:
             self.capture()

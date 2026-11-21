@@ -1,0 +1,871 @@
+"""Closed-loop tabletop trials using calibrated RGB-D, robot CAD and measured joints."""
+
+import json
+from itertools import pairwise
+
+import numpy as np
+from scipy.optimize import least_squares
+from scipy.spatial import cKDTree
+from scipy.spatial.transform import Rotation, Slerp
+
+from .head_wrist_geometry import hand_shapes
+from .head_wrist_trial import ARM, PALM, save
+from .tabletop_vision import Models, match_height, proposals, wrist_points
+
+
+class NoPath(ValueError):
+    pass
+
+
+def shifted(pose, offset):
+    result = pose.copy()
+    result[:3, 3] += offset
+    return result
+
+
+class ArmIK:
+    """Bounded seven-axis IK with the geometric Jacobian from the station URDF."""
+
+    def __init__(self, tree):
+        self.chain = tree._chain(PALM)
+        self.bounds = tree.joint_limits(ARM).T
+        if [j.name for j in self.chain if j.kind != "fixed"] != ARM:
+            raise ValueError("unexpected right arm chain")
+
+    def fk(self, q):
+        t = np.eye(4)
+        index = 0
+        for joint in self.chain:
+            t = t @ joint.origin
+            if joint.kind != "fixed":
+                t[:3, :3] = (
+                    t[:3, :3] @ Rotation.from_rotvec(joint.axis * q[index]).as_matrix()
+                )
+                index += 1
+        return t
+
+    def solve(self, pose, initial):
+        start = np.clip(initial, self.bounds[0] + 1e-7, self.bounds[1] - 1e-7)
+        last, jac = None, None
+
+        def evaluate(q):
+            nonlocal last, jac
+            t = np.eye(4)
+            axes, origins = [], []
+            for j in self.chain:
+                t = t @ j.origin
+                if j.kind != "fixed":
+                    axes.append(t[:3, :3] @ j.axis)
+                    origins.append(t[:3, 3].copy())
+                    t[:3, :3] = (
+                        t[:3, :3]
+                        @ Rotation.from_rotvec(j.axis * q[len(axes) - 1]).as_matrix()
+                    )
+            a = np.asarray(axes)
+            rot = Rotation.from_matrix(t[:3, :3] @ pose[:3, :3].T).as_rotvec()
+            # Inverse left Jacobian of the SO(3) logarithm.
+            x, y, z = rot
+            skew = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]])
+            angle = np.linalg.norm(rot)
+            c = (
+                (1 - 0.5 * angle / np.tan(0.5 * angle)) / angle**2
+                if angle > 1e-4
+                else 1 / 12
+            )
+            inv = np.eye(3) - 0.5 * skew + c * skew @ skew
+            jac = np.vstack([np.cross(a, t[:3, 3] - origins).T, 0.20 * inv @ a.T])
+            last = q.copy()
+            return np.r_[t[:3, 3] - pose[:3, 3], 0.20 * rot]
+
+        def derivative(q):
+            if last is None or not np.array_equal(q, last):
+                evaluate(q)
+            return jac
+
+        result = least_squares(
+            evaluate,
+            start,
+            jac=derivative,
+            bounds=self.bounds,
+            max_nfev=48,
+            ftol=1e-8,
+            xtol=1e-8,
+            gtol=1e-7,
+        )
+        r = result.fun
+        if np.linalg.norm(r[:3]) > 0.0035 or np.linalg.norm(r[3:]) > 0.009:
+            raise NoPath("arm IK")
+        return result.x
+
+
+class Controller:
+    def __init__(self, io, library, out):
+        self.io, self.library, self.out = io, library, out
+        self.models = Models(library)
+        self.ik = ArmIK(io.tree)
+        self.events, self.results = [], {}
+        self.name, self.attempt = "", 0
+        self.arm = io.q()[io.arm]
+        self.hand = io.q()[io.hand]
+        self.reference_arm = self.arm.copy()
+        self.mid_arm = np.array([1.71, 1.15, -1.85, -1.60, 0.43, 0.13, -0.34])
+        from .tabletop_views import ViewBank
+
+        self.bank = ViewBank(
+            self.ik, io.palm_from_wrist, self.mid_arm, self.reference_arm
+        )
+        self.hints = {}
+        self.table = None
+        self.cloud = np.empty((0, 3))
+        self.cache = {}
+        self.open_hand = self.hand.copy()
+        self.seen = {}
+        self.eye_from_palm = np.linalg.inv(io.palm_from_wrist)
+
+    def event(self, phase, **info):
+        row = dict(
+            time=round(self.io.time(), 5),
+            name=self.name,
+            attempt=self.attempt,
+            phase=phase,
+            **info,
+        )
+        self.events.append(row)
+        with (self.out / "events.jsonl").open("a") as file:
+            file.write(json.dumps(row, allow_nan=False) + "\n")
+        print(
+            "TABLE", self.name, self.attempt, phase, info.get("reason", ""), flush=True
+        )
+
+    def snapshot(self, role, tag):
+        frame = self.io.camera(role)
+        prefix = f"{len(self.events):04d}_{self.name or 'survey'}_{self.attempt}_{tag}_{role}"
+        # Store raw samples from each decision exposure; RGB, depth and FK share a timestamp.
+        np.savez_compressed(self.out / "observations" / (prefix + ".npz"), **frame)
+        return frame
+
+    def survey(self, wrist=False):
+        frame = self.snapshot("wrist" if wrist else "head", "survey")
+        self.table, pieces = proposals(frame, self.io, self.table)
+        if not wrist:
+            self.cloud = (
+                np.vstack([x["xyz"][::4] for x in pieces])
+                if pieces
+                else np.empty((0, 3))
+            )
+            self.head_pieces = pieces
+            self.seen = self.models.identify(pieces)
+        else:
+            # Merge two camera views by footprint proximity in world coordinates, then reassign globally.
+            combined = [dict(p) for p in self.head_pieces]
+            for item in pieces:
+                if len(item["xyz"]) < 28:
+                    continue
+                tree = cKDTree(item["xyz"][::3, :2])
+                overlap = [
+                    np.mean(tree.query(p["xyz"][::4, :2])[0] < 0.013) for p in combined
+                ]
+                j = int(np.argmax(overlap)) if overlap else -1
+                if j >= 0 and overlap[j] > 0.18:
+                    p = combined[j]
+                    from .tabletop_vision import appearance, dimensions
+
+                    for field in ("xyz", "rgb"):
+                        p[field] = np.concatenate([p[field], item[field]])
+                    p.update(
+                        dims=dimensions(p["xyz"], self.table),
+                        color=appearance(p["rgb"]),
+                        center=np.median(p["xyz"], 0),
+                    )
+                else:
+                    combined.append(item)
+            self.seen = self.models.identify(combined)
+        self.event(
+            "survey_wrist" if wrist else "survey_head",
+            objects={
+                n: {"xyz": p["center"].tolist(), "cost": round(p["match_cost"], 3)}
+                for n, p in self.seen.items()
+            },
+        )
+        return self.seen
+
+    def look_poses(self, point, distance=0.20):
+        current = self.io.fk(PALM) @ self.io.palm_from_wrist
+        for way in (
+            [-0.46, -0.36, 0.82],
+            [-0.73, 0.12, 0.68],
+            [-0.15, -0.68, 0.72],
+            [0, 0, 1],
+        ):
+            eye = point + distance * np.asarray(way) / np.linalg.norm(way)
+            z = (point - eye) / np.linalg.norm(point - eye)
+            for roll in (0, 90, -90, 180):
+                x = current[:3, 0] - z * (z @ current[:3, 0])
+                if np.linalg.norm(x) < 0.01:
+                    x = np.cross(z, [0, 1, 0])
+                x /= np.linalg.norm(x)
+                rot = (
+                    np.column_stack([x, np.cross(z, x), z])
+                    @ Rotation.from_euler("z", roll, degrees=True).as_matrix()
+                )
+                optical = np.eye(4)
+                optical[:3, :3], optical[:3, 3] = rot, eye
+                yield optical @ self.eye_from_palm
+
+    def visible(self, pose, pts):
+        optical = pose @ self.io.palm_from_wrist
+        cam = (pts - optical[:3, 3]) @ optical[:3, :3]
+        z = cam[:, 2]
+        k = self.io.wrist_K
+        uv = (
+            cam[:, :2] * np.array([k[0, 0], k[1, 1]]) / np.maximum(z[:, None], 1e-4)
+            + k[:2, 2]
+        )
+        return np.mean(
+            (z > 0.03)
+            & (z < 0.65)
+            & (uv[:, 0] > 14)
+            & (uv[:, 0] < 466)
+            & (uv[:, 1] > 14)
+            & (uv[:, 1] < 626)
+        )
+
+    def shape(self, hand):
+        key = np.round(hand, 4).tobytes()
+        if key not in self.cache:
+            pieces = hand_shapes(self.io.model, hand)
+            self.cache[key] = np.concatenate(
+                [v[:: max(1, len(v) // 100)] for v in pieces.values()]
+            )
+        return self.cache[key]
+
+    def clear(self, pose, hand, others=None):
+        vertices = self.shape(hand) @ pose[:3, :3].T + pose[:3, 3]
+        if vertices[:, 2].min() < self.table - 0.0015:
+            return False
+        if others is not None and len(others.data):
+            distance = others.query(vertices, distance_upper_bound=0.005)[0]
+            if np.count_nonzero(np.isfinite(distance)) >= 3:
+                return False
+        return True
+
+    def command(self, joints, hand, duration, guard=False):
+        io = self.io
+        start = io.q()[io.hand] if not guard else self.hand.copy()
+        hand = np.clip(hand, *io.model.limits["right"].T)
+        ticks = max(2, round(duration / io.dt))
+        for i in range(1, ticks + 1):
+            f = min(1.0, i / (0.84 * ticks))
+            f = f * f * (3 - 2 * f)
+            x = f * (len(joints) - 1)
+            j = min(int(x), len(joints) - 2)
+            arm = (1 - (x - j)) * joints[j] + (x - j) * joints[j + 1]
+            desired = start + f * (hand - start)
+            if guard:
+                # Bound incremental flexion preload against actual encoder positions.
+                actual = io.q()[io.hand]
+                flex = self.flex
+                desired[flex] = np.minimum(
+                    desired[flex], np.maximum(start[flex], actual[flex] + 0.20)
+                )
+            io.step(arm, desired)
+        self.arm, self.hand = arm.copy(), desired.copy()
+
+    def move(self, goal, hand, duration, others=None, transit=False):
+        actual = self.io.q()
+        start = self.io.fk(PALM, actual)
+        initial = actual[self.io.arm]
+        hand = np.clip(hand, *self.io.model.limits["right"].T)
+        measured = actual[self.io.hand]
+        delta = np.linalg.norm(start[:3, 3] - goal[:3, 3])
+        angle = Rotation.from_matrix(start[:3, :3].T @ goal[:3, :3]).magnitude()
+        anchors = [start]
+        if transit and delta > 0.13:
+            # Move above the observed objects along this particular transfer corridor.
+            corridor = self.cloud
+            if len(corridor):
+                d = goal[:2, 3] - start[:2, 3]
+                f = np.clip(
+                    (corridor[:, :2] - start[:2, 3]) @ d / max(d @ d, 1e-8), 0, 1
+                )
+                corridor = corridor[
+                    np.linalg.norm(
+                        corridor[:, :2] - start[:2, 3] - f[:, None] * d, axis=1
+                    )
+                    < 0.085
+                ]
+            top = np.quantile(corridor[:, 2], 0.97) if len(corridor) else self.table
+            h = max(start[2, 3], goal[2, 3], top + 0.085)
+            anchors.extend(
+                [
+                    shifted(start, [0, 0, h - start[2, 3]]),
+                    shifted(goal, [0, 0, h - goal[2, 3]]),
+                ]
+            )
+        anchors.append(goal)
+
+        def path(stations):
+            joints = [initial]
+            for seg, (a, b) in enumerate(pairwise(stations)):
+                r = Slerp([0, 1], Rotation.from_matrix([a[:3, :3], b[:3, :3]]))
+                count = max(
+                    1,
+                    int(np.ceil(np.linalg.norm(a[:3, 3] - b[:3, 3]) / 0.065)),
+                    int(
+                        np.ceil(
+                            Rotation.from_matrix(a[:3, :3].T @ b[:3, :3]).magnitude()
+                            / 0.42
+                        )
+                    ),
+                )
+                for f in np.linspace(0, 1, count + 1)[1:]:
+                    p = np.eye(4)
+                    p[:3, :3] = r(f).as_matrix()
+                    p[:3, 3] = (1 - f) * a[:3, 3] + f * b[:3, 3]
+                    hf = round(4 * (seg + f) / (len(stations) - 1)) / 4
+                    intermediate = (1 - hf) * measured + hf * hand
+                    if transit and not self.clear(p, intermediate, others):
+                        raise NoPath("observed obstacle or table")
+                    q = self.ik.solve(p, joints[-1])
+                    if np.max(np.abs(q - joints[-1])) > 1.35:
+                        raise NoPath("joint path discontinuity")
+                    joints.append(q)
+            return joints
+
+        try:
+            joints = path(anchors)
+        except NoPath:
+            if not transit:
+                raise
+            # Rotating from the upright park pose can cross a Cartesian singularity.
+            # Inspect complete interpolated joint paths against the current observed obstacles.
+            joints = None
+            # Sample in joint space around the high transfer corridor, including alternate elbow branches.
+            hint = self.hints.get(goal.round(5).tobytes())
+            endpoints = [] if hint is None else [hint]
+            for seed in (initial, self.mid_arm, self.reference_arm):
+                try:
+                    q = self.ik.solve(goal, seed)
+                    if not any(np.linalg.norm(q - v) < 0.12 for v in endpoints):
+                        endpoints.append(q)
+                except NoPath:
+                    continue
+            lifted = []
+            for anchor in (start, goal):
+                qlist = []
+                for dz in (0.11, 0.18):
+                    high = shifted(anchor, [0, 0, dz])
+                    for seed in (
+                        (initial, self.mid_arm)
+                        if anchor is start
+                        else (self.mid_arm, *endpoints[:1])
+                    ):
+                        try:
+                            q = self.ik.solve(high, seed)
+                        except NoPath:
+                            continue
+                        if self.clear(
+                            self.ik.fk(q), measured if anchor is start else hand, others
+                        ):
+                            qlist.append(q)
+                            break
+                lifted.append(qlist)
+            for endpoint in endpoints:
+                routes = [
+                    [initial, a, b, endpoint] for a in lifted[0] for b in lifted[1]
+                ]
+                routes.extend(
+                    [
+                        [initial, q, endpoint]
+                        for q in (*lifted[0], *lifted[1], self.mid_arm)
+                    ]
+                )
+                routes.insert(0, [initial, endpoint])
+                for stations in routes:
+                    samples = np.vstack(
+                        [
+                            np.linspace(
+                                a, b, max(4, int(np.max(np.abs(a - b)) / 0.13) + 2)
+                            )
+                            for a, b in pairwise(stations)
+                        ]
+                    )
+                    valid = True
+                    for f, q in zip(np.linspace(0, 1, len(samples)), samples):
+                        f = round(4 * f) / 4
+                        if not self.clear(
+                            self.ik.fk(q), (1 - f) * measured + f * hand, others
+                        ):
+                            valid = False
+                            break
+                    if valid:
+                        joints = samples
+                        break
+                if joints is not None:
+                    break
+            if joints is None and endpoints:
+                for endpoint in endpoints[:2]:
+                    joints = self.bank.route(
+                        initial,
+                        endpoint,
+                        lambda q: self.clear(self.ik.fk(q), hand, others),
+                    )
+                    if joints is not None:
+                        break
+            if joints is None:
+                raise NoPath("no clear arm path")
+        duration = max(
+            duration, np.sum(np.max(np.abs(np.diff(joints, axis=0)), axis=1)) / 2.4
+        )
+        self.command(joints, hand, max(duration, delta / 0.48, angle / 3.1))
+        error = np.linalg.norm(self.io.fk(PALM)[:3, 3] - goal[:3, 3])
+        if error > 0.026:
+            raise NoPath(f"measured tracking error {error:.3f} m")
+
+    def hold(self, seconds):
+        for _ in range(round(seconds / self.io.dt)):
+            self.io.step(self.arm, self.hand)
+
+    def leave_low_pose(self):
+        # Clear the recently handled object before addressing a different object.
+        # Preserve the local wrist pose on retry. Choose the smallest sufficient upward motion.
+        start = self.io.fk(PALM)
+        actual = self.io.q()
+        measured = actual[self.io.hand]
+        low = (self.shape(measured) @ start[2, :3]).min() + start[2, 3]
+        if low >= self.table + 0.12:
+            return
+        if len(self.cloud):
+            nearby = self.cloud[
+                np.linalg.norm(self.cloud[:, :2] - start[:2, 3], axis=1) < 0.13
+            ]
+        else:
+            nearby = []
+        needed = (
+            (np.quantile(np.asarray(nearby)[:, 2], 0.95) if len(nearby) else self.table)
+            + 0.026
+            - low
+        )
+        for scale in (1.0, 0.70, 0.44):
+            dz = scale * np.clip(needed, 0.085, 0.17)
+            try:
+                self.move(shifted(start, [-0.012, 0, dz]), self.open_hand, 0.46)
+                self.event("clear_previous_target", rise_m=round(float(dz), 3))
+                return
+            except NoPath:
+                continue
+
+    def inspect(self, goal, hand, others):
+        self.move(goal, hand, 0.53, others, True)
+
+    def coarse_surface(self, name, observed):
+        from .head_wrist_surface import RegisteredSurface
+
+        try:
+            surface, pose, fit = self.models.fit(name, observed["xyz"], self.table)
+            self.event(
+                "registered_head",
+                points=len(observed["xyz"]),
+                median_m=fit["median_residual_m"],
+                p90_m=fit["p90_residual_m"],
+                center=fit["center"],
+            )
+            return surface, pose, True
+        except ValueError:
+            # The coarse pose only selects a camera ROI. A wrench/closure cannot use this estimate alone.
+            surface = RegisteredSurface(self.models.bundles[name])
+            obs, local = observed["xyz"], surface.local
+            _, a = np.linalg.eigh(np.cov(local[:, :2].T))
+            _, b = np.linalg.eigh(np.cov(obs[:, :2].T))
+            angle = np.arctan2(b[1, -1], b[0, -1]) - np.arctan2(a[1, -1], a[0, -1])
+            pose = np.eye(4)
+            pose[:3, :3] = Rotation.from_euler("z", angle).as_matrix()
+            rotated = local @ pose[:3, :3].T
+            pose[:2, 3] = np.median(obs[:, :2], 0) - np.median(rotated[:, :2], 0)
+            pose[2, 3] = self.table - np.min(surface.support @ pose[2, :3])
+            surface.world = rotated + pose[:3, 3]
+            self.event(
+                "coarse_head_roi", center=observed["center"].tolist(), points=len(obs)
+            )
+            return surface, pose, False
+
+    def options(self, name, surface, pose, seeds, others):
+        point = (surface.world.min(0) + surface.world.max(0)) / 2
+        for s in seeds:
+            qo, qt, qc = [np.array(s[k]) for k in ("q_open", "q_touch", "q_tight")]
+            pad = hand_shapes(self.io.model, qt)
+            digits = (
+                ("index", "middle", "ring")
+                if name in ("bottle", "tube", "driver")
+                else ("index",)
+            )
+            fingers = np.mean(
+                [pad["right_" + n + "_elastomer"].mean(0) for n in digits], 0
+            )
+            mid = (pad["right_thumb_elastomer"].mean(0) + fingers) / 2
+            g = np.array(s["grasp"])
+            grip = pose[:3, :3] @ (g[:3, :3] @ mid + g[:3, 3]) + pose[:3, 3]
+            # Keep the same local patch on tools; upright cylinders admit more approach azimuths.
+            cylindrical = name in ("bottle", "tube", "ball", "can", "spray")
+            pivot = point.copy() if cylindrical else grip
+            angles = np.arange(0, 360, 30 if cylindrical else 45)
+            templates = {
+                k: pose @ np.array(s[k]) for k in ("pre", "grasp", "tight", "view")
+            }
+
+            def at(deg, k, templates=templates, pivot=pivot):
+                rot = Rotation.from_euler("z", deg, degrees=True).as_matrix()
+                p = templates[k].copy()
+                p[:3, :3] = rot @ p[:3, :3]
+                p[:3, 3] = pivot + rot @ (p[:3, 3] - pivot)
+                return p
+
+            for angle in sorted(
+                angles,
+                key=lambda a: np.linalg.norm(at(a, "pre")[:2, 3] - [0.39, -0.27]),
+            ):
+                poses = {k: at(angle, k) for k in templates}
+                floor = min(
+                    (self.shape(h) @ poses[k][2, :3]).min() + poses[k][2, 3]
+                    for k, h in (("pre", qo), ("grasp", qt), ("tight", qc))
+                )
+                dz = max(0.0, self.table + 0.001 - floor)
+                if dz > 0.032:
+                    continue
+                for p in poses.values():
+                    p[2, 3] += dz
+                if not self.clear(poses["pre"], qo, others) or not self.clear(
+                    poses["grasp"], qt, others
+                ):
+                    continue
+                for seed in (self.arm, self.mid_arm):
+                    try:
+                        q = self.ik.solve(poses["pre"], seed)
+                        self.ik.solve(poses["grasp"], q)
+                    except NoPath:
+                        continue
+                    yield s, poses, int(angle)
+                    break
+
+    def geometry(self, name, observed, choice):
+        surface, pose, accurate = self.coarse_surface(name, observed)
+        target = observed["xyz"]
+        cloud = self.cloud
+        if len(cloud):
+            # Exclude target observations, including its sparse side wall, from neighbor checking.
+            d1 = cKDTree(target[::2]).query(cloud)[0]
+            d2 = cKDTree(surface.world[::3]).query(cloud)[0]
+            cloud = cloud[(d1 > 0.017) & (d2 > 0.020)]
+        others = cKDTree(cloud)
+        point = (surface.world.max(0) + surface.world.min(0)) / 2
+        seeds = sorted(
+            self.library[name]["seeds"],
+            key=lambda s: s["posture"] in choice["prior_postures"],
+        )
+        first = next(self.options(name, surface, pose, seeds, others), None)
+        views = []
+        if first is not None:
+            s, poses, _ = first
+            views.append((poses["view"], np.array(s["q_open"])))
+        else:
+            s = seeds[0]
+        # The camera can observe an item even when the preliminary hand approach is unreachable.
+        hand = np.minimum(np.array(s["q_open"]), np.full(22, 0.44))
+        # A reachable optical pose with an explicit arm solution often avoids a singularity.
+        for v, q in self.bank.looks(point, self.io.q()[self.io.arm]):
+            self.hints[v.round(5).tobytes()] = q
+            views.append((v, self.open_hand))
+        views.extend(
+            (v, hand)
+            for distance in (0.22, 0.30, 0.15)
+            for v in self.look_poses(point, distance)
+        )
+        examined = 0
+        for v, h in views:
+            if self.visible(v, surface.world[::9]) < 0.29 or not self.clear(
+                v, h, others
+            ):
+                continue
+            try:
+                self.inspect(v, h, others)
+            except NoPath:
+                continue
+            fr = self.snapshot("wrist", "refine")
+            near = wrist_points(
+                fr, self.io, surface, self.table, 0.017 if accurate else 0.031
+            )
+            examined += 1
+            if len(near) >= 28:
+                coarse = target[:: max(1, len(target) // 310)]
+                fine = near[:: max(1, len(near) // 640)]
+                data = np.vstack([coarse, fine])
+                try:
+                    refined, reg, details = self.models.fit(
+                        name, data, self.table, surface if accurate else None
+                    )
+                except ValueError:
+                    try:
+                        refined, reg, details = self.models.fit(
+                            name, fine, self.table, surface if accurate else None
+                        )
+                    except ValueError:
+                        if examined >= 5:
+                            break
+                        continue
+                best = next(self.options(name, refined, reg, seeds, others), None)
+                self.event(
+                    "registered_wrist",
+                    points=len(near),
+                    median_m=details["median_residual_m"],
+                    center=details["center"],
+                )
+                # After a failed contact or when a transferred hand shape is unreachable,
+                # refit the catalog's thumb/finger pads to the new measured contact band.
+                if best is None or choice["prior_postures"]:
+                    from .tabletop_grips import patch_candidates
+
+                    for gaps, card, targets in patch_candidates(
+                        self, name, refined, seeds, others
+                    )[:24]:
+                        for initial in (self.arm, self.mid_arm):
+                            try:
+                                reached = self.ik.solve(targets["pre"], initial)
+                                self.ik.solve(targets["grasp"], reached)
+                            except NoPath:
+                                continue
+                            best = (card, targets, 0)
+                            self.event(
+                                "aligned_finger_pads",
+                                predicted_gap_cost_m=round(float(gaps), 4),
+                            )
+                            break
+                        else:
+                            continue
+                        break
+                if best is None:
+                    raise NoPath("no clear reachable posture after wrist registration")
+                s, poses, angle = best
+                self.event(
+                    "selected", posture=s["posture"], yaw_deg=angle, origin=s["origin"]
+                )
+                return refined, reg, poses, s, others
+            if examined >= 5:
+                break
+        raise NoPath(
+            "wrist target unconfirmed"
+            if examined
+            else "no clear arm path to wrist view"
+        )
+
+    def vote(self, surface, pose, palm0, color, tag):
+        held = self.io.fk(PALM) @ np.linalg.inv(palm0) @ pose
+        votes = {}
+        for role in ("head", "wrist"):
+            frame = self.snapshot(role, tag)
+            votes[role] = match_height(
+                frame, self.io, self.table, surface.local, pose, held, color
+            )
+        carried = sum(x.get("carried_pixels", 0) for x in votes.values())
+        static = sum(x.get("static_pixels", 0) for x in votes.values())
+        vote = "unknown"
+        if carried >= 12 and carried > 1.7 * static:
+            vote = "carried"
+        if static >= 12 and static > 1.7 * carried:
+            vote = "on_table"
+        self.event(tag, vote=vote, views=votes)
+        return vote
+
+    def trial(self, observed, result):
+        name = self.name
+        surface, pose, poses, seed, others = self.geometry(name, observed, result)
+        result["prior_postures"].append(seed["posture"])
+        pre, grasp, tight = [poses[k] for k in ("pre", "grasp", "tight")]
+        qo, qt, qc = [np.array(seed[k]) for k in ("q_open", "q_touch", "q_tight")]
+        if not self.clear(pre, qo, others) or not self.clear(grasp, qt, others):
+            raise NoPath("wrist refinement invalidated clearance")
+        self.event("approach", posture=seed["posture"])
+        self.move(pre, qo, 0.58, others, True)
+        first = self.io.fk(PALM)
+        close_started = False
+        try:
+            self.event(
+                "close",
+                posture=seed["posture"],
+                visual_center=surface.world.mean(0).tolist(),
+            )
+            close_started = True
+            self.closing(grasp, qt, 0.72)
+            self.closing(tight, qc, 0.46)
+            # Allow loaded fingers limited additional flexion only while position feedback lags.
+            # Positive flexion is bounded by the commanded posture and each actuator's native limits.
+            actual = self.io.q()[self.io.hand]
+            desired = self.hand.copy()
+            lag = desired[self.flex] - actual[self.flex]
+            push = np.where(
+                (lag > 0.035) & (lag < 0.30), np.minimum(lag * 0.32, 0.045), 0.0
+            )
+            desired[self.flex] += push
+            self.command([self.arm, self.arm], desired, 0.18, guard=True)
+            self.hold(0.22)
+            palm0 = self.io.fk(PALM)
+            self.event("test_lift")
+            self.move(shifted(palm0, [0, 0, 0.022]), self.hand, 0.44)
+            self.hold(0.16)
+            verdict = self.vote(
+                surface, pose, palm0, observed["color"], "test_observation"
+            )
+            if verdict == "unknown":
+                self.hold(0.14)
+                verdict = self.vote(
+                    surface, pose, palm0, observed["color"], "test_observation_repeat"
+                )
+            if verdict != "carried":
+                return verdict
+            self.move(shifted(palm0, [0, 0, 0.102]), self.hand, 0.78)
+            self.event("hold_start")
+            verdicts = []
+            for i in range(4):
+                self.hold(0.51)
+                verdicts.append(
+                    self.vote(surface, pose, palm0, observed["color"], f"hold_{i + 1}")
+                )
+                if verdicts[-1] == "on_table":
+                    break
+            self.event("hold_end")
+            return (
+                "vision_pass"
+                if len(verdicts) == 4
+                and verdicts.count("carried") >= 3
+                and verdicts[-1] == "carried"
+                else "unconfirmed"
+            )
+        finally:
+            if close_started:
+                self.event("lower_and_release")
+                current = self.io.fk(PALM)
+                if current[2, 3] > first[2, 3] + 0.011:
+                    try:
+                        self.move(
+                            shifted(current, [0, 0, first[2, 3] - current[2, 3]]),
+                            self.hand,
+                            0.57,
+                        )
+                    except NoPath:
+                        pass
+                self.command([self.arm, self.arm], (qo + self.open_hand) / 2, 0.35)
+                back = pre[:3, 3] - grasp[:3, 3]
+                if np.linalg.norm(back) < 0.005:
+                    back = np.array([-0.3, -0.2, 0.8])
+                back = back / np.linalg.norm(back) * 0.042
+                back[2] = max(back[2], 0.016)
+                try:
+                    self.move(shifted(self.io.fk(PALM), back), qo, 0.40)
+                except NoPath:
+                    pass
+                self.event("local_withdraw")
+
+    def closing(self, goal, hand, seconds):
+        actual = self.io.q()
+        start = actual[self.io.arm]
+        target = self.ik.solve(goal, start)
+        self.command([start, target], hand, seconds, guard=True)
+
+    def execute(self):
+        (self.out / "observations").mkdir()
+        self.flex = np.array(
+            [
+                i
+                for i, n in enumerate(self.io.model.hand_names["right"])
+                if n.endswith(("_FE", "_PIP", "_DIP", "_IP"))
+            ]
+        )
+        self.survey()
+        anchors = {name: dict(obs) for name, obs in self.seen.items()}
+        pending = list(self.library)
+        while pending:
+            if self.results:
+                self.leave_low_pose()
+            head = self.survey()
+            feedback = dict(head)
+            for name, ref in anchors.items():
+                if (
+                    name in head
+                    and np.linalg.norm(head[name]["center"][:2] - ref["center"][:2])
+                    < 0.047
+                ):
+                    anchors[name] = head[name]
+                    continue
+                # Use the last observed location to direct a fresh wrist exposure during occlusion.
+                feedback[name] = ref
+            for name, item in head.items():
+                if name not in anchors:
+                    anchors[name] = item
+            palm = self.io.fk(PALM)[:3, 3]
+
+            def priority(n, feedback=feedback, palm=palm):
+                if n not in feedback:
+                    return 20.0
+                obs = feedback[n]
+                return obs["match_cost"] + 1.5 * np.linalg.norm(
+                    obs["center"][:2] - palm[:2]
+                )
+
+            self.name = min(pending, key=priority)
+            pending.remove(self.name)
+            self.attempt = 0
+            result = {"prior_postures": [], "outcomes": []}
+            self.results[self.name] = result
+            for index in range(1, 3):
+                self.attempt = index
+                self.event("attempt_start")
+                observed = feedback.get(self.name)
+                if observed is None or observed["match_cost"] > 1.65:
+                    self.event("wrist_search")
+                    # Registered table survey positions are independent of the randomized object poses.
+                    for xy in ((0.80, -0.26), (0.76, 0.04)):
+                        p = np.array([*xy, self.table + 0.035])
+                        for v in self.look_poses(p, 0.24):
+                            if not self.clear(v, self.hand):
+                                continue
+                            try:
+                                self.inspect(v, self.hand, None)
+                            except NoPath:
+                                continue
+                            self.survey(True)
+                            break
+                        if (
+                            self.name in self.seen
+                            and self.seen[self.name]["match_cost"] < 1.65
+                        ):
+                            observed = self.seen[self.name]
+                            break
+                if observed is None or observed["match_cost"] > 1.65:
+                    reason = "unobserved"
+                else:
+                    try:
+                        reason = self.trial(observed, result)
+                    except (NoPath, ValueError) as error:
+                        reason = str(error)
+                result["outcomes"].append(reason)
+                self.event("attempt_end", reason=reason)
+                save(self.out / "decisions.json", self.results)
+                if reason == "vision_pass" or (
+                    index == 1 and not result["prior_postures"]
+                ):
+                    break
+                if index < 2:
+                    fresh = self.survey()
+                    if (
+                        self.name in fresh
+                        and np.linalg.norm(
+                            fresh[self.name]["center"][:2] - observed["center"][:2]
+                        )
+                        < 0.055
+                    ):
+                        feedback[self.name] = fresh[self.name]
+            self.event("target_end", reason=result["outcomes"][-1])
+        self.event("episode_end")
+
+
+def run(io, library, out):
+    Controller(io, library, out).execute()
