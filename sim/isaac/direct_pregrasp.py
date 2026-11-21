@@ -123,7 +123,7 @@ def path_clear(surface, a, b, shapes):
     return True
 
 
-def view_options(scene, surface, grasp, home, palm_camera, K, qhome):
+def view_options(scene, surface, grasp, home, palm_camera, K, qhome, *, nearby=False):
     fractions = np.linspace(0, 1, 9)
     closing = [hand_shapes(scene, (1 - f) * qhome + f * grasp.opened) for f in fractions]
     fixed = [closing[-1]] * len(fractions)
@@ -137,7 +137,9 @@ def view_options(scene, surface, grasp, home, palm_camera, K, qhome):
     def offer(pose):
         to_pre = np.linalg.norm(pose[:3, 3] - dest[:3, 3])
         from_home = np.linalg.norm(pose[:3, 3] - home[:3, 3])
-        if not 0.024 <= to_pre <= 0.18 or from_home < 0.025 or from_home > 0.32:
+        if not 0.024 <= to_pre <= 0.18 or from_home > (0.09 if nearby else 0.32):
+            return
+        if not nearby and from_home < 0.025:
             return
         if dest[2, 3] - pose[2, 3] > 0.012:
             return
@@ -151,6 +153,13 @@ def view_options(scene, surface, grasp, home, palm_camera, K, qhome):
         score = extra + 0.34 * to_pre + 0.030 * turn - 0.071 * min(visible, 0.9)
         options.append((score, pose, visible, extra, turn))
 
+    if nearby:
+        # The previous hand can already be at a usable observation distance.
+        # Check preshaping and turning in place with the same swept-hand tests.
+        for blend in (0.0, 0.33, 0.67, 1.0):
+            pivot = interpolate(home, dest, blend)
+            pivot[:3, 3] = home[:3, 3]
+            offer(pivot)
     for blend in (1.0, 0.86, 0.72, 0.58, 0.44, 0.32):
         base = interpolate(home, dest, blend)
         for progress in (0.46, 0.60, 0.72, 0.82):
@@ -218,13 +227,48 @@ class DirectGrasp(HeadWristTrial):
                     break
         return result
 
+    def catalog_options(self, role, coarse):
+        """Fit each template's finger opening and palm pose to this exposure and contact region."""
+        cfg, scene = self.cfg, self.scene
+        bounds = scene.limits["right"]
+        world = np.eye(4)
+        world[:3, :3] = self.registration["pose_world_rotation"]
+        world[:3, 3] = self.registration["pose_world_translation_m"]
+        candidates = []
+        for name, template in cfg["catalog_grasps"].items():
+            if name in self.used_postures or (coarse is not None and name != coarse.details["posture"]):
+                continue
+            pose = world @ np.asarray(template["T_mesh_palm"])
+            opened = np.clip(np.asarray(template["q_pre"]) * 0.45, *bounds.T)
+            limit = cfg["pinch_postures"][name]
+            if self.family == "side_wall":
+                reference = {"q_squeeze": limit, "grasp": pose}
+                grips = self.side_options(role, reference, opened, bounds)
+                rows = [(i * 0.00005, g) for i, g in enumerate(grips)]
+            else:
+                fitted = band_grasps(
+                    scene, self.surface, opened, bounds, {name: limit},
+                    upright_tip=self.family == "narrow_tip", bands=self.contact_bands(),
+                )
+                if cfg.get("check_pad_surfaces"):
+                    fitted = confirm_pad_surfaces(scene, self.surface, fitted)
+                rows = [(cost, Grasp(p, g, qo, qc, lim, meta)) for cost, p, g, qo, qc, lim, meta in fitted]
+            for cost, grip in rows:
+                grip.details.update(posture=name, catalog_mode_id=template["mode_id"])
+                change_m = np.linalg.norm(grip.close[:3, 3] - pose[:3, 3])
+                cost += 0.025 * change_m + 0.001 * rotation_error(grip.close, pose)
+                candidates.append((cost, grip))
+        return [g for _, g in sorted(candidates, key=lambda item: item[0])]
+
     def options(self, role, coarse=None):
         s = self.scene
         mode = self.family
         base = self.cfg["posture"]
         bounds = s.limits["right"]
         opened = np.clip(np.asarray(base["q_pre"]) * 0.45, *bounds.T)
-        if mode == "side_wall":
+        if self.cfg.get("catalog_grasps"):
+            candidates = self.catalog_options(role, coarse)
+        elif mode == "side_wall":
             candidates = self.side_options(role, base, opened, bounds)
         else:
             names = {
@@ -289,14 +333,16 @@ class DirectGrasp(HeadWristTrial):
         K = s.wrist_K.copy()
         K[:2, 2] -= 0.5
         seeds = self.options("head")
-        for j, grasp in enumerate(seeds):
-            for view, metadata in view_options(s, self.surface, grasp, home, camera, K, hand):
-                try:
-                    joints, _ = self.joint_path(home, view)
-                    self.following_path(view, grasp.pre, joints[-1])
-                except Rejected:
-                    continue
-                return grasp, view, dict(metadata, grasp_candidate=j + 1)
+        local_retry = getattr(self, "retry_route", None) == "local"
+        for nearby in ((True, False) if local_retry else (False,)):
+            for j, grasp in enumerate(seeds):
+                for view, metadata in view_options(s, self.surface, grasp, home, camera, K, hand, nearby=nearby):
+                    try:
+                        joints, _ = self.joint_path(home, view)
+                        self.following_path(view, grasp.pre, joints[-1])
+                    except Rejected:
+                        continue
+                    return grasp, view, dict(metadata, grasp_candidate=j + 1, nearby_view=nearby)
         raise Rejected(f"no direct visible and reachable approach for {self.family} ({len(seeds)} candidate grips)")
 
     def following_path(self, start, target, arm):
@@ -317,6 +363,7 @@ class DirectGrasp(HeadWristTrial):
     def attempt_grasp(self):
         s = self.scene
         self.head = self.observe("head")
+        self.registration = self.head
         self.family = family(self.surface.world)
         if self.cfg.get("side_lying_taper"):
             self.family = "across_handle"
@@ -337,7 +384,13 @@ class DirectGrasp(HeadWristTrial):
             head_grasp=coarse.close.tolist(),
             **details,
         )
-        self.move("move_to_pregrasp", view, coarse.opened, 1.40)
+        seconds = 1.40
+        if details.get("nearby_view"):
+            travel = np.linalg.norm(view[:3, 3] - home[:3, 3]) / 0.10
+            turn = rotation_error(home, view) / 1.1
+            preshape = np.max(np.abs(homeq - coarse.opened)) / 1.6
+            seconds = float(np.clip(max(travel, turn, preshape), 0.45, seconds))
+        self.move("move_to_pregrasp", view, coarse.opened, seconds)
         if np.max(np.abs(self.actual()[self.hand_ids] - coarse.opened)) > 0.15:
             raise Rejected("pregrasp finger tracking")
         self.event(
@@ -346,7 +399,7 @@ class DirectGrasp(HeadWristTrial):
             measured_fingers=self.actual()[self.hand_ids].tolist(),
         )
         self.command(s.target[0, self.arm_ids].cpu().numpy(), coarse.opened, view)
-        self.observe("wrist")
+        self.registration = self.observe("wrist")
         current = self.palm()
         for grip in self.options("wrist", coarse)[:60]:
             correction = np.linalg.norm(grip.close[:3, 3] - coarse.close[:3, 3])

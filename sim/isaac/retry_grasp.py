@@ -2,7 +2,8 @@
 
 import numpy as np
 
-from .direct_pregrasp import DirectGrasp
+from .direct_pregrasp import DirectGrasp, WristVisibility, path_clear
+from .head_wrist_geometry import hand_shapes
 from .head_wrist_trial import FINGERS, Rejected, save
 
 
@@ -37,6 +38,8 @@ def taper_bands(surface, attempt):
 
 class RetryGrasp(DirectGrasp):
     def event(self, stage, **details):
+        if stage in ("head_mesh", "head_exposure") and self.observation_dir.name == "after_release":
+            details["observation_subdir"] = "after_release"
         super().event(stage, attempt=getattr(self, "attempt_number", 0), **details)
 
     def contact_bands(self):
@@ -75,24 +78,36 @@ class RetryGrasp(DirectGrasp):
     def object_pose(self):
         return self.scene.objects[self.object_name].data.root_state_w[0, :7].cpu().numpy().copy()
 
-    def recover(self, start_palm, start_hand):
-        """Return a loaded object to support, unload, then retract through the observed approach."""
+    def local_retreat(self, hand):
+        """Back along the last observed approach and prefer a D405 view on that short path."""
+        start = self.palm()
+        to_view = self.selected_view[:3, 3] - start[:3, 3]
+        length = np.linalg.norm(to_view)
+        shape = hand_shapes(self.scene, hand)
+        k = self.scene.wrist_K.copy()
+        k[:2, 2] -= 0.5
+        camera = WristVisibility(np.linalg.solve(start, self.wrist_optical()), k, shape, self.scene.table_bounds)
+        points = self.surface.world[::max(1, len(self.surface.world) // 170)]
+        choices = []
+        for distance in np.unique(np.minimum([0.0, 0.012, 0.024, 0.036, 0.048], length)):
+            goal = start.copy()
+            goal[:3, 3] += to_view * distance / max(length, 1e-8)
+            if not path_clear(self.surface, start, goal, [shape] * 6):
+                continue
+            try:
+                self.joint_path(start, goal)
+            except Rejected:
+                continue
+            visible = camera.fraction(goal, points)
+            # If this hand blocks the camera, retain room to rotate into the next hand shape.
+            choices.append(((visible < 0.21, -min(visible, 0.21), distance), goal, visible))
+        if choices:
+            _, goal, visible = min(choices, key=lambda row: row[0])
+            return goal, visible
+        return None
+
+    def wait_for_rest(self):
         s = self.scene
-        grip = self.selected_grasp
-        if grip is not None:
-            hand = s.target[0, self.hand_ids].cpu().numpy().copy()
-            last = self.samples[-1] if self.samples else {}
-            if last.get("hand_contacts") and last.get("clearance_m", 0) > 0.005:
-                down = self.palm()
-                down[2, 3] -= min(last["clearance_m"], 0.13)
-                self.move("return_to_support", down, hand, 0.7, allow_contact=True)
-            self.held.clear()
-            if any(
-                e["attempt"] == self.attempt_number and e["stage"] == "approach_contact_band" for e in self.events
-            ):
-                self.move("release_grip", grip.pre, grip.opened, 0.72, allow_contact=True)
-                self.move("withdraw_hand", self.selected_view, grip.opened, 0.72, allow_contact=True)
-            self.move("clear_for_reobservation", start_palm, start_hand, 0.90, allow_contact=True)
         self.event("await_free_rest")
         arm = s.target[0, self.arm_ids].cpu().numpy().copy()
         hand = s.target[0, self.hand_ids].cpu().numpy().copy()
@@ -109,9 +124,74 @@ class RetryGrasp(DirectGrasp):
             )
             stable = stable + 1 if free else 0
             if stable >= round(0.15 / self.dt):
-                self.event("reobservation_ready", object_pose_wxyz=self.object_pose().tolist(), free_ticks=stable)
-                return
-        raise Rejected("object did not settle free of the hand after release")
+                return stable
+        return 0
+
+    def recover(self, start_palm, start_hand):
+        """Unload before opening. Return home only when a nearby observation cannot be made."""
+        grip = self.selected_grasp
+        failed_palm = self.palm()
+        self.retry_route = "local"
+        fallback = None
+        if grip is not None:
+            hand = self.scene.target[0, self.hand_ids].cpu().numpy().copy()
+            last = self.samples[-1] if self.samples else {}
+            if last.get("hand_contacts") and last.get("clearance_m", 0) > 0.005:
+                down = self.palm()
+                down[2, 3] -= min(last["clearance_m"], 0.13)
+                self.move("return_to_support", down, hand, 0.7, allow_contact=True)
+            self.held.clear()
+            entered = any(
+                e["attempt"] == self.attempt_number and e["stage"] == "approach_contact_band" for e in self.events
+            )
+            if entered:
+                # If this leg stopped early its planned endpoint may be inside the object.
+                reached = self.attempts[-1]["terminal_stage"] != "approach_contact_band"
+                self.move("release_grip", grip.pre if reached else self.palm(), grip.opened, 0.72, allow_contact=True)
+            elif last.get("hand_contacts"):
+                self.move("release_grip", self.palm(), grip.opened, 0.72, allow_contact=True)
+            # The object may have shifted. Preserve both original exposures for this attempt.
+            saved_dir = self.observation_dir
+            self.observation_dir = saved_dir / "after_release"
+            self.observation_dir.mkdir()
+            try:
+                self.observe("head")
+            except Rejected as exc:
+                fallback = str(exc)
+            finally:
+                self.observation_dir = saved_dir
+            if fallback is None:
+                hand = self.scene.target[0, self.hand_ids].cpu().numpy().copy()
+                choice = self.local_retreat(hand)
+                if choice is None:
+                    fallback = "no clearance along the short retreat"
+                else:
+                    goal, visible = choice
+                    self.event("local_retreat_selected", predicted_visible_fraction=float(visible))
+                    if np.linalg.norm(goal[:3, 3] - self.palm()[:3, 3]) > 0.002:
+                        self.move("local_retreat", goal, hand, 0.45, allow_contact=True)
+        stable = self.wait_for_rest() if fallback is None else 0
+        if not stable and grip is not None:
+            self.retry_route = "previous_view"
+            self.event("retry_wider_view", reason=fallback or "object still moving or touching the hand")
+            self.move("withdraw_hand", self.selected_view, grip.opened, 0.72, allow_contact=True)
+            stable = self.wait_for_rest()
+            if not stable:
+                self.retry_route = "home"
+                self.move("clear_for_reobservation", start_palm, start_hand, 0.90, allow_contact=True)
+                stable = self.wait_for_rest()
+        if not stable:
+            raise Rejected("object did not settle free of the hand after release")
+        end = self.palm()
+        self.event(
+            "reobservation_ready",
+            route=self.retry_route,
+            free_ticks=stable,
+            palm=end.tolist(),
+            distance_from_failure_m=float(np.linalg.norm(end[:3, 3] - failed_palm[:3, 3])),
+            distance_from_home_m=float(np.linalg.norm(end[:3, 3] - start_palm[:3, 3])),
+            object_pose_wxyz=self.object_pose().tolist(),
+        )
 
     def execute(self):
         if not self.cfg.get("use_wrist"):
@@ -123,6 +203,7 @@ class RetryGrasp(DirectGrasp):
             raise Rejected("initial contact-free settling failed")
         self.event("settled", object_pose_wxyz=self.object_pose().tolist())
         self.used_postures = set()
+        self.retry_route = None
         self.attempts = []
         self.outcome["attempts"] = self.attempts
         start_palm = self.palm()

@@ -10,11 +10,52 @@ from .handle_contacts import FINGERS, handle_observations, loaded_digits
 from .power_wrap import envelope_contacts
 
 
+def retry_distances(events, tracking):
+    """Measure actual palm motion from failure to free rest, including any set-down."""
+    first_move = next((e for e in events if e["stage"] == "move_to_pregrasp"), None)
+    if not first_move or not tracking:
+        return []
+    home = np.asarray(first_move["start"])[:3, 3]
+    times = np.asarray([r["time"] for r in tracking])
+    xyz = np.asarray([r["palm"] for r in tracking])[:, :3, 3]
+
+    def position(t):
+        return np.array([np.interp(t, times, values) for values in xyz.T])
+
+    measures = []
+    for ready in (e for e in events if e["stage"] == "reobservation_ready"):
+        attempt = ready["attempt"]
+        fail = next(e for e in events if e["attempt"] == attempt and e["stage"] == "attempt_failed")
+        start, end = fail["sim_time"], ready["sim_time"]
+        path = np.vstack([position(start), xyz[(times > start) & (times < end)], position(end)])
+        measurement = dict(
+            attempt=attempt, route=ready.get("route"), start_s=start, end_s=end,
+            maximum_displacement_m=float(np.linalg.norm(path - path[0], axis=1).max()),
+            path_length_m=float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum()),
+            end_distance_from_home_m=float(np.linalg.norm(path[-1] - home)),
+        )
+        next_attempt = [e for e in events if e.get("attempt") == attempt + 1]
+        arrival = next((e for e in next_attempt if e["stage"] == "pregrasp_arrived"), None)
+        exposure = next((e for e in next_attempt if e["stage"] == "wrist_mesh"), None)
+        if arrival and exposure:
+            palm = np.asarray(arrival["measured_palm"])
+            view = np.vstack([path[0], xyz[(times > start) & (times <= exposure["sim_time"])], palm[:3, 3]])
+            maximum = np.linalg.norm(view - path[0], axis=1).max()
+            measurement["maximum_displacement_through_next_wrist_m"] = float(maximum)
+            if "palm" in ready:
+                rotation = np.asarray(ready["palm"])[:3, :3].T @ palm[:3, :3]
+                cosine = np.clip((np.trace(rotation) - 1) / 2, -1, 1)
+                measurement["turn_to_next_wrist_deg"] = float(np.rad2deg(np.arccos(cosine)))
+        measures.append(measurement)
+    return measures
+
+
 def score(directory):
     def read(name):
         return json.loads((directory / name).read_text())
 
-    config, result, events = read("config.json"), read("result.json"), read("events.json")
+    config, result = read("config.json"), read("result.json")
+    events = read("events.json") if (directory / "events.json").exists() else result["events"]
     physics, frames = read("physics.json"), read("frames.json")
     dt = config["physics_dt"]
     if (
@@ -33,6 +74,8 @@ def score(directory):
         "attempts": result.get("attempts", []),
         "hold_steps": len(hold),
     }
+    if any(e["stage"] == "reobservation_ready" for e in events):
+        summary["recoveries"] = retry_distances(events, read("tracking.json"))
     if not hold:
         if result["passed"]:
             raise ValueError("successful episode is missing the hold window")
@@ -53,6 +96,24 @@ def score(directory):
     ):
         raise ValueError("reported success disagrees with native lift or hold measurements")
     grip = next(e for e in trial if e["stage"] == "refined_grasp")
+    catalog = config.get("head_wrist_validation", {}).get("catalog_grasps")
+    if catalog:
+        method = catalog.get(grip["posture"])
+        if method is None or method["mode_id"] != grip.get("catalog_mode_id"):
+            raise ValueError("executed wrist grasp is missing its configured catalog mode")
+        summary["catalog_mode_id"] = method["mode_id"]
+        contacts = [loaded_digits(row["link_normal_N"]) for row in hold]
+        summary["digit_ticks"] = {digit: sum(digit in c for c in contacts) for digit in FINGERS}
+        summary["minimum_loaded_digits"] = min(map(len, contacts))
+        if result["passed"] and not grip.get("tool_handle"):
+            opposed = sum(
+                bool(row["pads"].get("right_thumb_elastomer"))
+                and any(row["pads"].get(f"right_{f}_elastomer") for f in FINGERS if f != "thumb")
+                for row in hold
+            )
+            summary["opposed_pad_steps"] = opposed
+            if opposed != required_steps:
+                raise ValueError("hold lost the opposing thumb and finger pads")
     if grip.get("tool_handle"):
         measured = [loaded_digits(r["link_normal_N"]) for r in hold]
         summary["digit_ticks"] = {d: sum(d in contacts for contacts in measured) for d in FINGERS}

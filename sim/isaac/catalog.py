@@ -123,10 +123,48 @@ def palm_case(config, selection, count):
     result = copy.deepcopy(config)
     settings = result["head_wrist_validation"]
     shortlist = selection["candidates"][:count]
+    settings.pop("catalog_grasps", None)
     settings["wrap_postures"] = [c["posture"] for c in shortlist]
     settings.setdefault("pinch_postures", {}).update({c["posture"]: c["grasp"]["q_rad"] for c in shortlist})
     settings["whole_palm"] = True
     settings["require_palm_hold"] = True
+    settings["record_link_forces"] = True
+    settings["max_grasp_attempts"] = len(shortlist)
+    return result
+
+
+def opposed_case(config, selection, count):
+    """Transfer compatible catalog modes in object coordinates for a fresh camera-guided episode."""
+    if selection["goal"] != "any" or not 1 <= count <= 8:
+        raise ValueError("expected an unrestricted query and one to eight shortlisted modes")
+    result = copy.deepcopy(config)
+    settings = result["head_wrist_validation"]
+    handle = settings.get("multi_finger_handle", False)
+    choices = []
+    for candidate in selection["candidates"]:
+        contacts = candidate["intended_contacts"]
+        digits = {d for d in ("thumb", *DIGITS) if any(k.startswith(f"right_{d}_") for k in contacts)}
+        if {"thumb", "index"} <= digits and (not handle or len(digits) >= 3):
+            choices.append((len(digits), candidate))
+    if handle:
+        choices.sort(key=lambda pair: -pair[0])
+    shortlist = [candidate for _, candidate in choices[:count]]
+    if not shortlist:
+        return None
+    mesh_from_world = np.linalg.inv(rigid_transform(selection["T_world_mesh"]))
+    settings["catalog_grasps"] = {
+        c["posture"]: {
+            "mode_id": c["mode_id"],
+            "q_pre": c["pregrasp"]["q_rad"],
+            "T_mesh_palm": (mesh_from_world @ rigid_transform(c["grasp"]["T_world_palm"])).tolist(),
+        }
+        for c in shortlist
+    }
+    settings["pinch_postures"] = {c["posture"]: c["squeeze"]["q_rad"] for c in shortlist}
+    settings.pop("gesture_order", None)
+    settings["whole_palm"] = False
+    settings["require_palm_hold"] = False
+    settings["record_link_forces"] = True
     settings["max_grasp_attempts"] = len(shortlist)
     return result
 
@@ -217,14 +255,15 @@ def main():
     if args.mesh:
         result["mesh"] = {"file": args.mesh.name, "meters_per_unit": args.meters_per_unit}
     native = None
-    # The native controller refits this seed library to fresh head/wrist observations.
-    # Restrict this bridge to the standing side-wall cases it implements.
+    # The palm controller fits cylindrical sides; opposed contacts use their own surface fit.
     cyl = result["shape"] in ("slender_cylinder", "stout_cylinder")
     axis = features["cylinder_fit"]["axis_bbox"]
     if config is not None and args.goal == "palm_wrap" and result["candidates"] and cyl:
         world_axis = (matrix @ features["T_obj_bbox"])[:3, axis]
         if abs(world_axis[2]) >= np.cos(np.deg2rad(25)):
             native = palm_case(config, result, args.shortlist)
+    elif config is not None and args.goal == "any":
+        native = opposed_case(config, result, args.shortlist)
     args.out.mkdir(parents=True, exist_ok=False)
     (args.out / "candidates.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
     if native is not None:

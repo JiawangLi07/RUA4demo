@@ -130,9 +130,10 @@ def handle_grasps(trial, coarse):
     cfg, scene, surface = trial.cfg, trial.scene, trial.surface
     origin, axis, normal, bands = handle_sections(surface.world)
     library = cfg["pinch_postures"]
-    order = cfg.get("gesture_order", TOOL_GRASPS)
+    allowed = cfg.get("catalog_grasps", TOOL_GRASPS)
+    order = cfg.get("gesture_order", allowed)
     names = [
-        n for n in (*order, *TOOL_GRASPS) if n in TOOL_GRASPS and n in library and n not in trial.used_postures
+        n for n in dict.fromkeys((*order, *allowed)) if n in allowed and n in library and n not in trial.used_postures
     ]
     if not names:
         raise Rejected("multi-finger handle postures exhausted")
@@ -201,6 +202,8 @@ def handle_grasps(trial, coarse):
             handle_sections_m=bands.tolist(),
             tilt_deg=tilt,
         )
+        if cfg.get("catalog_grasps"):
+            details["catalog_mode_id"] = cfg["catalog_grasps"][name]["mode_id"]
         candidates.append(Grasp(pre, pose, opened, q, q, details))
         if len(candidates) >= 18:
             break

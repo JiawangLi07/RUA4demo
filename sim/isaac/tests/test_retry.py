@@ -8,6 +8,7 @@ from sim.isaac.direct_pregrasp import WristVisibility
 from sim.isaac.head_wrist_trial import HeadWristTrial, Rejected
 from sim.isaac.power_wrap import envelope_contacts, phalangeal_support, tactile_cylinder_center
 from sim.isaac.retry_grasp import RetryGrasp, taper_bands
+from sim.isaac.score import retry_distances
 
 
 def test_wrap_requires_a_palm_and_distributed_loaded_phalanges():
@@ -101,6 +102,117 @@ def test_camera_behind_the_table_edge_cannot_use_hidden_points():
     assert imager.fraction(np.eye(4), points) == 0
     camera[2, 3] = 0.74
     assert imager.fraction(np.eye(4), points) == 1
+
+
+def test_local_retreat_uses_the_nearest_clear_reachable_view(monkeypatch):
+    from sim.isaac import retry_grasp
+
+    trial = RetryGrasp.__new__(RetryGrasp)
+    trial.scene = SimpleNamespace(wrist_K=np.eye(3), table_bounds=None)
+    trial.palm = lambda: np.eye(4)
+    trial.wrist_optical = trial.palm
+    trial.selected_view = np.eye(4)
+    trial.selected_view[0, 3] = 0.20
+    trial.surface = SimpleNamespace(world=np.zeros((50, 3)), clear=lambda shape, pose, margin: True)
+    monkeypatch.setattr(retry_grasp, "hand_shapes", lambda scene, hand: {})
+    monkeypatch.setattr(WristVisibility, "fraction", lambda self, pose, points: 10 * pose[0, 3])
+
+    def reachable(start, goal):
+        if np.isclose(goal[0, 3], 0.024):
+            raise Rejected("unreachable")
+
+    trial.joint_path = reachable
+    pose, fraction = trial.local_retreat(np.zeros(22))
+    np.testing.assert_allclose(pose[:3, 3], [0.036, 0, 0])
+    assert fraction >= 0.21
+    trial.surface.clear = lambda *args: False
+    assert trial.local_retreat(np.zeros(22)) is None
+
+
+def test_retry_distance_uses_measured_palm_and_interpolates_event_boundaries():
+    home = np.eye(4)
+    end, view = home.copy(), home.copy()
+    end[0, 3], view[0, 3] = 0.09, 0.05
+    view[:2, :2] = [[0, -1], [1, 0]]
+    events = [dict(stage="move_to_pregrasp", start=home, attempt=1),
+              dict(stage="attempt_failed", sim_time=0.5, attempt=1),
+              dict(stage="reobservation_ready", sim_time=2.5, attempt=1, route="local", palm=end),
+              dict(stage="pregrasp_arrived", sim_time=3.8, attempt=2, measured_palm=view),
+              dict(stage="wrist_mesh", sim_time=4.0, attempt=2)]
+    records = []
+    for t, x in enumerate([0.14, 0.12, 0.08, 0.10, 0.05]):
+        palm = home.copy()
+        palm[0, 3] = x
+        records.append(dict(time=t, palm=palm, goal=home))
+    row, = retry_distances(events, records)
+    assert row["route"] == "local"
+    np.testing.assert_allclose([row["maximum_displacement_m"], row["path_length_m"],
+                                row["end_distance_from_home_m"]], [0.05, 0.06, 0.09])
+    assert np.isclose(row["maximum_displacement_through_next_wrist_m"], 0.08)
+    assert np.isclose(row["turn_to_next_wrist_deg"], 90)
+
+
+def test_recovery_keeps_the_hand_nearby_and_records_fallbacks(tmp_path):
+    class Target:
+        def __getitem__(self, key):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return np.zeros(22)
+
+    class Trial(RetryGrasp):
+        def event(self, stage, **metadata):
+            self.events.append(dict(stage=stage, attempt=1, **metadata))
+
+        def palm(self):
+            return self.location.copy()
+
+        def move(self, stage, pose, hand, seconds, **options):
+            self.event(stage)
+            self.location = pose.copy()
+
+        def observe(self, role):
+            assert role == "head" and self.observation_dir.name == "after_release"
+
+        def local_retreat(self, hand):
+            return self.local
+
+        def wait_for_rest(self):
+            return next(self.free)
+
+        def object_pose(self):
+            return np.array([0, 0, 0, 1, 0, 0, 0])
+
+    for route, free in (("local", [36]), ("previous_view", [0, 36]), ("home", [0, 0, 36])):
+        trial = Trial.__new__(Trial)
+        home = np.eye(4)
+        trial.location = home.copy()
+        trial.location[0, 3] = 0.20
+        trial.scene = SimpleNamespace(target=Target())
+        trial.observation_dir = tmp_path / route
+        trial.observation_dir.mkdir()
+        trial.attempt_number, trial.hand_ids, trial.held = 1, list(range(22)), {"thumb"}
+        trial.events = [dict(attempt=1, stage="approach_contact_band")]
+        trial.attempts = [dict(terminal_stage="test_lift_check")]
+        trial.selected_view = trial.palm()
+        trial.selected_view[0, 3] = 0.10
+        trial.selected_grasp = SimpleNamespace(pre=trial.palm(), opened=np.zeros(22))
+        trial.samples = [dict(hand_contacts=2, clearance_m=0.018)]
+        nearby = trial.palm()
+        nearby[0, 3] -= 0.025
+        trial.local, trial.free = (nearby, 0.4), iter(free)
+        trial.recover(home, np.zeros(22))
+        stages = [e["stage"] for e in trial.events]
+        assert stages.index("return_to_support") < stages.index("release_grip") < stages.index("local_retreat")
+        assert ("clear_for_reobservation" in stages) == (route == "home")
+        end = trial.events[-1]
+        assert end["route"] == route and end["free_ticks"] == 36 and not trial.held
+        if route == "local":
+            assert np.isclose(end["distance_from_failure_m"], 0.025)
+            assert np.isclose(end["distance_from_home_m"], 0.175)
 
 
 def test_phalangeal_probe_requires_thumb_opposition_and_several_loaded_digits():

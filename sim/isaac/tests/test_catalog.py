@@ -1,11 +1,13 @@
 import json
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from sim.isaac import catalog
-from sim.isaac.catalog import palm_case, palm_contacts, select
+from sim.isaac.catalog import opposed_case, palm_case, palm_contacts, select
+from sim.isaac.direct_pregrasp import DirectGrasp, Grasp
 from sim.isaac.paths import RIGHT_JOINTS
 from sim.isaac.score import score
 
@@ -19,14 +21,51 @@ def test_requested_contact_includes_the_palm_and_distinct_proximal_fingers():
 
 
 def test_native_case_uses_the_shortlist_and_preserves_the_starting_profile():
-    base = {"head_wrist_validation": {"pinch_postures": {"original": [1] * 22}}}
+    base = {"head_wrist_validation": {"pinch_postures": {"original": [1] * 22}, "catalog_grasps": {"old": {}}}}
     candidates = [{"posture": name, "grasp": {"q_rad": [v] * 22}} for name, v in (("one", 0.2), ("two", 0.4))]
     selection = {"goal": "palm_wrap", "shape": "stout_cylinder", "candidates": candidates}
     updated = palm_case(base, selection, 1)["head_wrist_validation"]
     assert updated["wrap_postures"] == ["one"] and updated["max_grasp_attempts"] == 1
     assert updated["require_palm_hold"]
+    assert updated["record_link_forces"] and "catalog_grasps" not in updated
     assert updated["pinch_postures"]["one"] == [0.2] * 22
     assert list(base["head_wrist_validation"]["pinch_postures"]) == ["original"]
+
+
+def test_handle_bridge_requires_several_fingers_and_wrist_refits_the_local_pose():
+    head = np.eye(4)
+    head[:3, 3] = [0.5, -0.2, 0.7]
+    local = np.eye(4)
+    local[:3, 3] = [0.01, 0.02, 0.05]
+    candidates = []
+    for i, digits in enumerate((("thumb", "index"), ("thumb", "index", "middle"), ("thumb", "index", "middle", "ring"))):
+        candidates.append({
+            "posture": f"p{i}", "mode_id": f"m{i}", "intended_contacts": [f"right_{d}_DP" for d in digits],
+            "grasp": {"T_world_palm": (head @ local).tolist()},
+            "pregrasp": {"q_rad": [0.2] * 22}, "squeeze": {"q_rad": [0.6] * 22},
+        })
+    selection = {"goal": "any", "T_world_mesh": head.tolist(), "candidates": candidates}
+    base = {"head_wrist_validation": {"multi_finger_handle": True, "gesture_order": ["old"], "pinch_postures": {"old": []}}}
+    settings = opposed_case(base, selection, 2)["head_wrist_validation"]
+    assert list(settings["catalog_grasps"]) == ["p2", "p1"]
+    assert list(settings["pinch_postures"]) == ["p2", "p1"]
+    assert "gesture_order" not in settings and base["head_wrist_validation"]["gesture_order"] == ["old"]
+    np.testing.assert_allclose(settings["catalog_grasps"]["p2"]["T_mesh_palm"], local)
+    wrist = np.eye(4)
+    wrist[:2, :2] = [[0, -1], [1, 0]]
+    wrist[:3, 3] = [0.53, -0.20, 0.71]
+    trial = DirectGrasp.__new__(DirectGrasp)
+    trial.registration = {"pose_world_rotation": wrist[:3, :3], "pose_world_translation_m": wrist[:3, 3]}
+    trial.cfg, trial.family, trial.used_postures = settings, "side_wall", {"p1"}
+    trial.scene = SimpleNamespace(limits={"right": np.tile([-1, 2], (22, 1))})
+
+    def side_options(role, reference, opened, bounds):
+        np.testing.assert_allclose(reference["grasp"], wrist @ local)
+        return [Grasp(reference["grasp"], reference["grasp"], opened, opened, opened, {})]
+
+    trial.side_options = side_options
+    grips = trial.catalog_options("wrist", SimpleNamespace(details={"posture": "p2"}))
+    assert [g.details for g in grips] == [{"posture": "p2", "catalog_mode_id": "m2"}]
 
 
 def test_scoring_requires_palm_contact_at_every_hold_step(tmp_path):
