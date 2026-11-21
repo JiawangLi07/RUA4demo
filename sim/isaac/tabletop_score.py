@@ -20,7 +20,16 @@ def path_minimum(pose, vertices):
     return result + pose[:, 2]
 
 
-def evaluate(scene, directory):
+def evaluate(scene, directory, lift_height=None):
+    if lift_height is None:
+        settings = directory / "trial_settings.json"
+        lift_height = (
+            json.loads(settings.read_bytes())["lift_height_m"]
+            if settings.is_file()
+            else 0.09
+        )
+    if not np.isfinite(lift_height) or lift_height <= 0:
+        raise ValueError("lift height must be positive metres")
     events = [
         json.loads(s) for s in (directory / "events.jsonl").read_text().splitlines()
     ]
@@ -51,7 +60,8 @@ def evaluate(scene, directory):
         return int(np.clip(round(t / dt) - 1, 0, length - 1))
 
     for name, decision in decisions.items():
-        target = names.index(name)
+        physical_name = scene.get("evaluation_aliases", {}).get(name, name)
+        target = names.index(physical_name)
         tries = []
         for index, why in enumerate(decision["outcomes"], 1):
             ev = [e for e in events if e["name"] == name and e["attempt"] == index]
@@ -81,7 +91,7 @@ def evaluate(scene, directory):
             row["other_motion_over_2cm"] = {
                 n: round(float(x), 4)
                 for n, x in zip(names, travel)
-                if n != name and x > 0.020
+                if n != physical_name and x > 0.020
             }
             if row["closure"]:
                 a = tick(phases["close"]["time"])
@@ -106,15 +116,17 @@ def evaluate(scene, directory):
                 row["other_lift_over_2cm"] = {
                     n: round(float(x), 4)
                     for n, x in zip(names, rises)
-                    if n != name and x > 0.02
+                    if n != physical_name and x > 0.02
                 }
-                met = (rise >= 0.09) & (b >= 0.09)
+                met = (rise >= lift_height) & (b >= lift_height)
                 spans = np.flatnonzero(
                     np.diff(np.r_[False, met, False].astype(int))
                 ).reshape(-1, 2)
-                row["longest_9cm_s"] = round(
+                row["longest_above_goal_s"] = round(
                     max([0.0, *[(v - u - 1) * dt for u, v in spans]]), 4
                 )
+                if lift_height == 0.09:
+                    row["longest_9cm_s"] = row["longest_above_goal_s"]
                 pr = Rotation.from_quat(p[:, [4, 5, 6, 3]])
                 rr = Rotation.from_quat(t[:, [4, 5, 6, 3]])
                 local = pr.inv().apply(t[:, :3] - p[:, :3])
@@ -133,9 +145,43 @@ def evaluate(scene, directory):
                             .max()
                         )
                         if dp <= 0.03 and dr <= 0.5:
+                            if "digit_load_N" in recording.files:
+                                window_loads = recording["digit_load_N"][
+                                    a + start : a + stop, :, target
+                                ]
+                                digits = recording["digit_names"].tolist()
+                                row["minimum_loaded_digits"] = int(
+                                    (window_loads > 0.25).sum(axis=1).min()
+                                )
+                                row["thumb_and_two_other_loaded_fraction"] = round(
+                                    float(
+                                        np.mean(
+                                            (
+                                                window_loads[:, digits.index("thumb")]
+                                                > 0.25
+                                            )
+                                            & ((window_loads > 0.25).sum(axis=1) >= 3)
+                                        )
+                                    ),
+                                    4,
+                                )
+                                row["mean_digit_load_N"] = dict(
+                                    zip(
+                                        digits,
+                                        np.round(
+                                            window_loads.mean(axis=0).astype(float), 3
+                                        ).tolist(),
+                                    )
+                                )
                             row.update(
                                 stable=True,
                                 held_s=round((window - 1) * dt, 4),
+                                minimum_held_rise_m=round(
+                                    float(rise[start:stop].min()), 4
+                                ),
+                                minimum_held_clearance_m=round(
+                                    float(b[start:stop].min()), 4
+                                ),
                                 relative_drift_m=round(float(dp), 4),
                                 relative_rotation_rad=round(float(dr), 4),
                             )
@@ -143,10 +189,11 @@ def evaluate(scene, directory):
                     if row["stable"]:
                         break
             tries.append(row)
-        scores[name] = tries
+        scores[physical_name] = tries
     return {
         "seed": scene["tabletop_seed"],
         "objects": len(scores),
+        "required_lift_m": lift_height,
         "closed": sum(any(r["closure"] for r in rows) for rows in scores.values()),
         "loaded": sum(
             any(r.get("hand_contact_s", 0) > 0 for r in rows)
@@ -165,7 +212,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scene", type=Path, required=True)
     parser.add_argument("--run", type=Path, required=True)
+    parser.add_argument(
+        "--lift-height-m",
+        type=float,
+        help="override recorded physical acceptance height",
+    )
+    parser.add_argument(
+        "--out", type=Path, help="optional path for scoring an alternative threshold"
+    )
     args = parser.parse_args()
-    result = evaluate(json.loads(args.scene.read_bytes()), args.run)
-    (args.run / "score.json").write_text(json.dumps(result, indent=2) + "\n")
+    result = evaluate(json.loads(args.scene.read_bytes()), args.run, args.lift_height_m)
+    (args.out or args.run / "score.json").write_text(
+        json.dumps(result, indent=2) + "\n"
+    )
     print({k: v for k, v in result.items() if k != "per_object"})

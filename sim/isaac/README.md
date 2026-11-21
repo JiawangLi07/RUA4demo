@@ -116,19 +116,32 @@ CPU 回归可运行 `python -m pytest -q sim/isaac/tests`。依赖为 NumPy、Sc
 
 同一张桌上摆放 14 个独立刚体。每个随机种子重新抽取平面位置和朝向，初始凸包之间至少留 12 mm。羽毛球横放。双臂从后撤的竖掌姿态开始，掌根在工位坐标系的 `(0.24, ±0.31, 0.95)` 米，指尖向上，左右掌相对。第一帧头部相机在这个姿态下曝光。当前由右手执行，左手保持起姿。
 
-控制器从标定的头部 D455 深度图估计桌面，结合前景的尺寸和颜色识别物体。腕部 D405 重新曝光、配准并修正局部网格。候选来自已有 36 类手形目录和先前单件标定，均保存于物体坐标系内。手指闭合使用关节位置回读限制预紧。试提约 2 cm 时，两台相机分别比较物体留在桌面和随手运动这两种预测。通过试提的目标继续抬升并保持 2 s。失败时在物体附近松手、换形或换视角。遮挡、配准失败、路径不可达和闭合后滑脱各自保留在同一段录像及事件记录中。
+物体目录中的每一项只提供一份米制网格。控制器用头部 D455 的深度估计桌面、分割前景，结合尺寸与外观为目标配准。D405 接近后重新采样表面。对侧面未观测到的区域继续使用配准网格，每个接触点会记录来源。当前配准支持给定静置朝向附近的俯仰与横滚、任意桌面平移与偏航。
 
-重放包提供米制资产及 `objects.json`、`library.json`。物理尺寸、质量和摩擦取自该包，运动使用仿真 RGB-D、相机标定、机器人 CAD 与关节回读。每个种子使用一个新的输出目录。
+两次观测各自查询同一份 36 类手形库。腕部阶段按截面选择可接近的两侧或可包络的侧壁。普通物体的候选共同优化六自由度掌位、22 个手指关节以及接触点的位置和法向，比较对握方向、假设摩擦锥对重力的支持、手部离桌空间、邻物和臂的可达性。高侧壁增加掌面、近节和中节接触，带局部粗柄的细长物体沿连续截面分配拇指和多根对握指。最后一段使用关节编码器逐指闭合，试提和保持期间继续维持预紧。编码器偏差只是接触的间接证据。头部和腕部图像分别测量目标是否跟手与底部的运动；两厘米试提后，可靠的视觉高度估计可触发小幅补偿，再计时保持。失败会在目标附近张手、局部退开并重新观察。
+
+### 用一个新网格运行
+
+重放包提供 `shared_postures.json.gz` 和工位资产。若已有 DexBridge 手形训练目录，也可以用 `PYTHONPATH="$DEXBRIDGE_ROOT/src:$PWD" python -m sim.isaac.tabletop_catalog --index "$DEXBRIDGE_ROOT/configs/skills/sharpa_grasp_templates.json" --out shared_postures.json.gz` 生成这份共享库。运行时只需导出的文件。
 
 ```bash
-export RUA_SIM_ASSETS="/path/to/replay"
-tar -xzf "$RUA_SIM_ASSETS/real2sim_0417.tgz" -C "$RUA_SIM_ASSETS"
+export RUA_SIM_ASSETS="/path/to/new-table"
+mkdir -p "$RUA_SIM_ASSETS"
+tar -xzf /path/to/replay/real2sim_0417.tgz -C "$RUA_SIM_ASSETS"
+python -m sim.isaac.tabletop_registry --mesh object.glb --meters-per-unit 1 --up-axis z \
+  --catalog /path/to/replay/shared_postures.json.gz --out "$RUA_SIM_ASSETS"
 python -m sim.isaac.tabletop_layout --base sim/isaac/config/station.json \
   --objects "$RUA_SIM_ASSETS/objects.json" --seed 41 --out table41.json
 "$ISAAC_PYTHON" -m sim.isaac.tabletop_native --scene table41.json \
-  --library "$RUA_SIM_ASSETS/library.json" --out runs/table41 --headless --device cuda:0
+  --library "$RUA_SIM_ASSETS/registry.json" --out runs/table41 --headless --device cuda:0
 OPENBLAS_NUM_THREADS=1 python -m sim.isaac.tabletop_score --scene table41.json --run runs/table41
-python -m sim.isaac.tabletop_video --run runs/table41 --speed 2 --out table41-2x.mp4
+python -m sim.isaac.tabletop_video --scene table41.json --run runs/table41 --speed 2 --out table41-2x.mp4
 ```
 
-`observations/` 保存决策曝光的 RGB、深度、相机内外参和同一时刻的实测关节角。`events.jsonl` 是带时间戳的动作记录。`physics_audit.npz` 由独立记录器保存，评分器在一回合结束后读取。稳定抓取要求指定物体的参考点抬升和碰撞几何最低点离桌均达 9 cm，持续 2 s，期间至少 90% 的时间有手部载荷（>0.05 N），相对手掌的位置漂移不超过 3 cm，旋转漂移不超过 0.5 rad。每次尝试还记录周围物体的位移。仿真相机输出理想深度，当前验证覆盖已有物体先验。
+可重复传入 `--mesh` 构建多物体场景。GLB、OBJ 和 STL 的导入使用 Trimesh 4，需传入每模型单位对应的米数。示例中的 1 适用于原单位已经是米的网格。`--up-axis` 指定静置时向上的轴。可直接使用已标定的多凸包 NPZ。普通网格导入器为每个有体积的连通块生成凸包，凹槽、把手孔或弯曲物体可用预分解 NPZ 保留物理细节。仿真质量默认为每件 80 g，静动摩擦均为 0.6；这些是场景假设。只含腕部连接件的实物尺寸未知。
+
+### 重放和验收
+
+在原始散摆回放包上，将 `RUA_SIM_ASSETS` 指向解包后的目录，并向原生入口传入 `scene41.json` 或 `scene73.json` 以及 `--library anon14.json`。四个独立构造的网格使用 `scene317.json` 和 `anon4.json`。清单中的匿名标识关联几何；场景中的 `evaluation_aliases` 仅供离线评分与视频字幕使用。历史单件参考清单 `library.json` 另存以复现早期对照。原生入口输出目录应是新目录。视频工具可读取回合内双路 PNG，或对应的 `head.mp4`、`observer.mp4`。
+
+`observations/` 保存决策时的 RGB、深度、相机标定与实测关节角。`events.jsonl` 记录求得的掌位、指角、接触区、各阶段和失败原因。`physics_audit.npz` 保存独立评分用的逐步真值。随机桌面的默认目标为 5 cm。持稳要求指定物体的本体抬升与最低点离桌同时达到目标高度、连续 2 s，期间至少 90% 的时间有手部载荷（超过 0.05 N），相对掌位平移漂移不超过 3 cm，旋转漂移不超过 0.5 rad。仿真使用理想 RGB-D，桌上所有物体在重试和切换间保持物理状态；视觉判定可与离线评分逐项对照。执行与评分均支持 `--lift-height-m`。历史回合保留原判据，另评 5 cm 时可加 `--lift-height-m 0.05 --out score_5cm.json`。

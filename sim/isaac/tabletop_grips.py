@@ -13,7 +13,56 @@ def basis(axis, direction):
     return np.column_stack([u, v, np.cross(u, v)])
 
 
-def patch_candidates(controller, name, surface, seeds, others):
+def wrap_candidates(controller, surface, seeds, used, others):
+    from types import SimpleNamespace
+
+    from .head_wrist_trial import PALM
+    from .power_wrap import wrap_grasps
+
+    seeds = {
+        s["posture"]: s
+        for s in seeds
+        if s["posture"] not in used and PALM in s.get("intended_contacts", [])
+    }
+    names = list(seeds)[:3]
+    if not names:
+        return []
+    context = SimpleNamespace(
+        scene=controller.io.model,
+        surface=surface,
+        palm=lambda: controller.io.fk(PALM),
+        used_postures=set(used),
+        wrap_fit_cache=controller.wrap_cache,
+        cfg={
+            "pinch_postures": {n: seeds[n]["q_touch"] for n in names},
+            "wrap_postures": names,
+        },
+    )
+    result = []
+    for g in wrap_grasps(context, None):
+        if not controller.clear(g.pre, g.opened, others) or not controller.clear(
+            g.close, g.closed, others
+        ):
+            continue
+        card = dict(
+            seeds[g.details["posture"]],
+            q_open=g.opened,
+            q_touch=g.closed,
+            origin="measured_palm_wrap",
+        )
+        result.append(
+            (
+                card,
+                {"pre": g.pre, "grasp": g.close, "tight": g.close},
+                g.details["yaw_deg"],
+            )
+        )
+        if len(result) == 5:
+            break
+    return result
+
+
+def patch_candidates(controller, family, surface, seeds, others):
     from .handle_grasp import handle_sections
     from .head_wrist_trial import Rejected
 
@@ -21,23 +70,14 @@ def patch_candidates(controller, name, surface, seeds, others):
     center = (world.max(0) + world.min(0)) / 2
     _, axes = np.linalg.eigh(np.cov(world[:, :2].T))
     across = axes[:, 0]
-    if name == "driver":
+    if family == "handled":
         try:
             origin, along, across, sections = handle_sections(world)
         except Rejected:
             return []
         row = sections[len(sections) // 2]
         center = np.r_[origin + along * row[0] + across * row[1], row[2]]
-    elif name in (
-        "shuttle",
-        "marker",
-        "metal",
-        "wire",
-        "redtool",
-        "white",
-        "cushion",
-        "box",
-    ):
+    elif family in ("slender", "edge", "small"):
         sections = surface.bands()
         if sections:
             # Small contact patches on thin edges can be reached without straddling the full width.
@@ -53,7 +93,7 @@ def patch_candidates(controller, name, surface, seeds, others):
         thumb = support["right_thumb_elastomer"]
         digits = (
             ("index", "middle", "ring")
-            if name in ("driver", "bottle", "tube", "can", "spray")
+            if family in ("handled", "wrap")
             else ("index", "middle")
         )
         clouds = [support[f"right_{d}_elastomer"] for d in digits]
@@ -62,7 +102,7 @@ def patch_candidates(controller, name, surface, seeds, others):
         mid = (finger + t) * 0.5
         src = basis(finger - t, mid)
         axes2 = [across, -across]
-        if name in ("ball", "bottle", "tube", "can", "spray"):
+        if family in ("wrap", "compact"):
             axes2 = [
                 np.array([np.cos(a), np.sin(a)])
                 for a in np.arange(0, 2 * np.pi, np.pi / 4)

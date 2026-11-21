@@ -13,9 +13,22 @@ from .head_wrist_geometry import hand_shapes
 class RegisteredSurface:
     """A support-aligned local mesh, with pose inferred from the exposed surface."""
 
-    def __init__(self, bundle):
+    def __init__(self, bundle, *, sample_faces=False):
         vertices, faces, _ = bundle["visual"]
         points = np.vstack([vertices, vertices[faces].mean(axis=1)])
+        # A coarse box or a shaft with two triangular end caps still has continuous
+        # faces. Include area-weighted surface samples when vertex spacing is coarse.
+        triangles = vertices[faces]
+        area = np.linalg.norm(np.cross(triangles[:, 1] - triangles[:, 0],
+                                       triangles[:, 2] - triangles[:, 0]), axis=1) / 2
+        if sample_faces and (area.max() > 0.00005 or len(points) < 500):
+            n = int(np.clip(area.sum() / 0.000006, 900, 6500))
+            rng = np.random.default_rng(0)
+            tri = triangles[rng.choice(len(triangles), n, p=area / area.sum())]
+            u, v = rng.random((2, n))
+            u = np.sqrt(u)
+            points = np.vstack([points, ((1-u)[:, None] * tri[:, 0]
+                                + (u*(1-v))[:, None] * tri[:, 1] + (u*v)[:, None] * tri[:, 2])])
         self.local = points[:: max(1, len(points) // 9000)]
         self.tree = cKDTree(self.local)
         self.parts = [v for v, _ in bundle["collisions"]]

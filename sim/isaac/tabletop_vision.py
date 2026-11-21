@@ -122,10 +122,17 @@ class Models:
         }
         self.features = {}
         for name, bundle in self.bundles.items():
-            v, _, _ = bundle["visual"]
+            v, _, colors = bundle["visual"]
             self.features[name] = (
                 dimensions(v, v[:, 2].min()),
-                np.asarray(library[name]["color"]),
+                np.asarray(
+                    library[name].get(
+                        "color",
+                        appearance(
+                            (np.clip(colors, 0, 1) ** (1 / 2.2) * 255).astype(np.uint8)
+                        ),
+                    )
+                ),
             )
 
     def identify(self, components):
@@ -152,7 +159,7 @@ class Models:
         }
 
     def fit(self, name, points, table, previous=None):
-        surface = RegisteredSurface(self.bundles[name])
+        surface = RegisteredSurface(self.bundles[name], sample_faces=True)
         if previous is not None:
             surface.fit = previous.fit.copy()
         info = surface.register(points, table)
@@ -160,6 +167,32 @@ class Models:
         pose[:3, :3] = info["pose_world_rotation"]
         pose[:3, 3] = info["pose_world_translation_m"]
         return surface, pose, info
+
+
+def add_live_samples(surface, head, wrist):
+    """Retain real camera samples for surface targets and for local handle cross sections."""
+    surface.camera_samples = {}
+    for name, cloud in (("head_depth", head), ("wrist_depth", wrist)):
+        if not len(cloud):
+            continue
+        unique = np.unique(
+            np.floor(cloud / 0.0025).astype(int), axis=0, return_index=True
+        )[1]
+        pts = cloud[unique]
+        pts = pts[:: max(1, int(np.ceil(len(pts) / 1600)))]
+        good = cKDTree(surface.world).query(pts)[0] < 0.013
+        if good.sum() >= 8:
+            surface.camera_samples[name] = pts[good]
+    # Correct only locally observed parts. Unseen surfaces retain the registered shape prior.
+    updated = surface.world.copy()
+    for cloud in surface.camera_samples.values():
+        dist, idx = cKDTree(cloud).query(surface.world, k=min(5, len(cloud)))
+        local = dist[:, -1] < 0.012
+        if local.any():
+            residual = cloud[idx[local]].mean(1) - surface.world[local]
+            updated[local] += np.clip(residual, -0.004, 0.004) * 0.35
+    surface.handle_world = updated
+    return surface
 
 
 def wrist_points(frame, io, surface, table, margin=0.015):
@@ -206,7 +239,27 @@ def match_height(frame, io, table, model_points, resting, held, reference_color)
         vote = "carried"
     if wins0 >= 10 and wins0 > 1.7 * wins1:
         vote = "on_table"
+    evidence = {}
+    displacement = held[:3, 3] - resting[:3, 3]
+    if 0.010 < displacement[2] < 0.042:
+        # A compliant grasp can take up clearance before the object starts moving.
+        # Estimate continuous visible object motion during the small verification lift.
+        amounts = np.linspace(0, 1.20, 10)
+        initial = cKDTree(ref0)
+        scores = np.array(
+            [initial.query(pts - alpha * displacement)[0] for alpha in amounts]
+        )
+        use = (scores.min(0) < 0.009) & (np.ptp(scores, axis=0) > 0.005)
+        if use.sum() >= 24:
+            loss = np.mean(np.minimum(scores[:, use], 0.012), axis=1)
+            best = int(np.argmin(loss))
+            evidence = {
+                "visible_lift_m": round(float(amounts[best] * displacement[2]), 5),
+                "height_support": int(use.sum()),
+                "height_margin_m": round(float(loss[0] - loss[best]), 6),
+            }
     return {
+        **evidence,
         "votes": vote,
         "points": len(pts),
         "carried_pixels": int(wins1),

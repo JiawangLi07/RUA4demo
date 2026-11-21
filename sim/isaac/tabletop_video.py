@@ -22,6 +22,10 @@ TARGETS = {
     "tube": "球筒",
     "white": "白色小件",
     "wire": "线材",
+    "egg": "椭球",
+    "spool": "线轴",
+    "block": "方块",
+    "stepped_rod": "阶梯杆",
 }
 PHASES = {
     "survey_head": "头部观测桌面",
@@ -32,12 +36,23 @@ PHASES = {
     "wrist_search": "换视角",
     "registered_wrist": "腕部近景配准",
     "selected": "选定手形",
+    "mesh_contact_family": "按网格几何选择接触部位",
     "aligned_finger_pads": "根据腕部网格调整指腹位置",
+    "mesh_fitted_palm_and_joints": "腕部网格求解掌位和各指角度",
+    "continuous_mesh_closure": "按关节回读逐指收拢",
+    "mesh_closure_readback": "核对各指闭合",
+    "seat_handle_encoders": "逐指贴合粗手柄",
+    "handle_encoder_readback": "核对手柄两侧指位",
+    "handle_reobserved": "复测闭合后的手柄",
+    "mesh_reobserved": "复测手指间的物体位置",
+    "handle_plan": "从腕部网格拟合多指对握",
     "approach": "接近物体",
     "close": "闭合手指",
     "test_lift": "试提约 2 厘米",
     "test_observation": "核对物体是否跟手",
     "test_observation_repeat": "复核试提",
+    "measure_lift_clearance": "测量物体悬空高度",
+    "correct_lift_clearance": "按物体实测高度补偿",
     "hold_start": "开始计时保持",
     "hold_end": "结束保持",
     "lower_and_release": "放低并松开",
@@ -57,7 +72,7 @@ def clock(seconds):
     return f"{hour:02d}:{minute:02d}:{second:02d},{ms:03d}"
 
 
-def render(run, out, speed):
+def render(run, out, speed, scene=None):
     frames = json.loads((run / "frames.json").read_bytes())
     if len(frames) < 2:
         raise ValueError("two or more recorded frames required")
@@ -68,10 +83,16 @@ def render(run, out, speed):
     events = [
         json.loads(line) for line in (run / "events.jsonl").read_text().splitlines()
     ]
+    scene = scene or run / "scene.json"
+    aliases = (
+        json.loads(scene.read_bytes()).get("evaluation_aliases", {})
+        if scene.is_file()
+        else {}
+    )
     lines = [(0.0, "双臂后撤，指尖向上，掌心相对")]
     for event in events:
         phase = event["phase"]
-        name = event["name"]
+        name = aliases.get(event["name"], event["name"])
         msg = PHASES.get(phase, "视觉核对保持" if phase.startswith("hold_") else "")
         if not msg:
             continue
@@ -162,6 +183,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--scene", type=Path, help="optional offline display names")
     parser.add_argument("--speed", type=int, choices=(1, 2), default=1)
     args = parser.parse_args()
-    render(args.run, args.out, args.speed)
+    render(args.run, args.out, args.speed, args.scene)

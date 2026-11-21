@@ -1,7 +1,7 @@
 """Closed-loop tabletop trials using calibrated RGB-D, robot CAD and measured joints."""
 
 import json
-from itertools import pairwise
+from itertools import islice, pairwise
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -10,6 +10,7 @@ from scipy.spatial.transform import Rotation, Slerp
 
 from .head_wrist_geometry import hand_shapes
 from .head_wrist_trial import ARM, PALM, save
+from .tabletop_catalog import geometry_family
 from .tabletop_vision import Models, match_height, proposals, wrist_points
 
 
@@ -99,9 +100,24 @@ class ArmIK:
 
 
 class Controller:
-    def __init__(self, io, library, out):
+    def __init__(
+        self, io, library, out, template_comparison=False, shared=None, lift_height=0.05
+    ):
         self.io, self.library, self.out = io, library, out
         self.models = Models(library)
+        self.shared = shared
+        if not 0.03 <= lift_height <= 0.20:
+            raise ValueError("expected a lift goal between 0.03 and 0.20 metres")
+        self.lift_height = lift_height
+        from .tabletop_meshfit import HandContacts
+
+        self.hand_contacts = HandContacts(io)
+        self.handle_library = {}
+        self.wrap_cache = {}
+        self.template_comparison = template_comparison
+        self.tracks = {}
+        self.lift_views = {}
+        self.grip_guard = None
         self.ik = ArmIK(io.tree)
         self.events, self.results = [], {}
         self.name, self.attempt = "", 0
@@ -230,6 +246,9 @@ class Controller:
             & (uv[:, 1] < 626)
         )
 
+    def link_shapes(self, hand):
+        return hand_shapes(self.io.model, hand)
+
     def shape(self, hand):
         key = np.round(hand, 4).tobytes()
         if key not in self.cache:
@@ -251,7 +270,10 @@ class Controller:
 
     def command(self, joints, hand, duration, guard=False):
         io = self.io
-        start = io.q()[io.hand] if not guard else self.hand.copy()
+        keep_preload = guard or (
+            not self.template_comparison and np.array_equal(hand, self.hand)
+        )
+        start = self.hand.copy() if keep_preload else io.q()[io.hand]
         hand = np.clip(hand, *io.model.limits["right"].T)
         ticks = max(2, round(duration / io.dt))
         for i in range(1, ticks + 1):
@@ -268,6 +290,10 @@ class Controller:
                 desired[flex] = np.minimum(
                     desired[flex], np.maximum(start[flex], actual[flex] + 0.20)
                 )
+            if self.grip_guard is not None:
+                if i % 8 == 1:
+                    self.hand = self.maintained_hand()
+                desired = self.hand
             io.step(arm, desired)
         self.arm, self.hand = arm.copy(), desired.copy()
 
@@ -424,6 +450,8 @@ class Controller:
 
     def hold(self, seconds):
         for _ in range(round(seconds / self.io.dt)):
+            if self.grip_guard is not None and _ % 8 == 0:
+                self.hand = self.maintained_hand()
             self.io.step(self.arm, self.hand)
 
     def leave_low_pose(self):
@@ -473,7 +501,7 @@ class Controller:
             return surface, pose, True
         except ValueError:
             # The coarse pose only selects a camera ROI. A wrench/closure cannot use this estimate alone.
-            surface = RegisteredSurface(self.models.bundles[name])
+            surface = RegisteredSurface(self.models.bundles[name], sample_faces=True)
             obs, local = observed["xyz"], surface.local
             _, a = np.linalg.eigh(np.cov(local[:, :2].T))
             _, b = np.linalg.eigh(np.cov(obs[:, :2].T))
@@ -484,19 +512,20 @@ class Controller:
             pose[:2, 3] = np.median(obs[:, :2], 0) - np.median(rotated[:, :2], 0)
             pose[2, 3] = self.table - np.min(surface.support @ pose[2, :3])
             surface.world = rotated + pose[:3, 3]
+            surface.table = self.table
             self.event(
                 "coarse_head_roi", center=observed["center"].tolist(), points=len(obs)
             )
             return surface, pose, False
 
-    def options(self, name, surface, pose, seeds, others):
+    def options(self, family, surface, pose, seeds, others):
         point = (surface.world.min(0) + surface.world.max(0)) / 2
         for s in seeds:
             qo, qt, qc = [np.array(s[k]) for k in ("q_open", "q_touch", "q_tight")]
             pad = hand_shapes(self.io.model, qt)
             digits = (
                 ("index", "middle", "ring")
-                if name in ("bottle", "tube", "driver")
+                if family in ("wrap", "handled")
                 else ("index",)
             )
             fingers = np.mean(
@@ -506,7 +535,7 @@ class Controller:
             g = np.array(s["grasp"])
             grip = pose[:3, :3] @ (g[:3, :3] @ mid + g[:3, 3]) + pose[:3, 3]
             # Keep the same local patch on tools; upright cylinders admit more approach azimuths.
-            cylindrical = name in ("bottle", "tube", "ball", "can", "spray")
+            cylindrical = family in ("wrap", "compact")
             pivot = point.copy() if cylindrical else grip
             angles = np.arange(0, 360, 30 if cylindrical else 45)
             templates = {
@@ -558,12 +587,25 @@ class Controller:
             cloud = cloud[(d1 > 0.017) & (d2 > 0.020)]
         others = cKDTree(cloud)
         point = (surface.world.max(0) + surface.world.min(0)) / 2
-        seeds = sorted(
-            self.library[name]["seeds"],
-            key=lambda s: s["posture"] in choice["prior_postures"],
+        family, available = (
+            self.shared.query(surface, pose)
+            if self.shared
+            else (geometry_family(surface), self.library[name]["seeds"])
         )
-        first = next(self.options(name, surface, pose, seeds, others), None)
+        seeds = sorted(
+            available, key=lambda s: s["posture"] in choice["prior_postures"]
+        )
         views = []
+        # For the shared library the head estimate only guides the approaching wrist.
+        # The final arm/hand IK is computed after that exposure.
+        first = (
+            None
+            if self.shared and family not in ("handled", "slender")
+            else next(self.options(family, surface, pose, seeds[:5], others), None)
+        )
+        if self.shared and first is None and family not in ("handled", "slender"):
+            head_goal = pose @ np.array(seeds[0]["view"])
+            views.append((head_goal, np.array(seeds[0]["q_open"])))
         if first is not None:
             s, poses, _ = first
             views.append((poses["view"], np.array(s["q_open"])))
@@ -612,7 +654,24 @@ class Controller:
                         if examined >= 5:
                             break
                         continue
-                best = next(self.options(name, refined, reg, seeds, others), None)
+                from .tabletop_vision import add_live_samples
+
+                add_live_samples(refined, target, near)
+                family, available = (
+                    self.shared.query(refined, reg)
+                    if self.shared
+                    else (geometry_family(refined), self.library[name]["seeds"])
+                )
+                seeds = sorted(
+                    available, key=lambda s: s["posture"] in choice["prior_postures"]
+                )
+                best = None
+                self.event(
+                    "mesh_contact_family",
+                    family=family,
+                    types_considered=(36 if self.shared else len(seeds)),
+                    shared_catalog=bool(self.shared),
+                )
                 self.event(
                     "registered_wrist",
                     points=len(near),
@@ -621,11 +680,61 @@ class Controller:
                 )
                 # After a failed contact or when a transferred hand shape is unreachable,
                 # refit the catalog's thumb/finger pads to the new measured contact band.
-                if best is None or choice["prior_postures"]:
+                if family == "handled" and not self.template_comparison:
+                    from .tabletop_handle import plan
+
+                    cards = {s["posture"]: s["q_touch"] for s in available}
+                    if not self.shared:
+                        cards.update(self.library[name].get("handle_cards", {}))
+                    best = plan(self, refined, choice["prior_postures"], others, cards)
+                if best is None and not self.template_comparison:
+                    from .tabletop_grips import patch_candidates
+                    from .tabletop_meshfit import refine
+
+                    coarse_options = list(
+                        islice(self.options(family, refined, reg, seeds[:4], others), 3)
+                    )
+                    anatomical = patch_candidates(
+                        self, family, refined, seeds[:6], others
+                    )
+                    # Include contact-band initializations with diverse palm directions.
+                    sampled = []
+                    for _, card, p in anatomical:
+                        if any(
+                            other[0]["posture"] == card["posture"]
+                            and np.linalg.norm(
+                                p["grasp"][:3, 3] - other[1]["grasp"][:3, 3]
+                            )
+                            < 0.022
+                            for other in sampled
+                        ):
+                            continue
+                        sampled.append((card, p, 0))
+                        if len(sampled) == 5:
+                            break
+                    if family == "wrap":
+                        from .tabletop_grips import wrap_candidates
+
+                        sampled = [
+                            *wrap_candidates(
+                                self, refined, seeds, choice["prior_postures"], others
+                            ),
+                            *sampled,
+                        ]
+                    best = refine(
+                        self, family, refined, [*sampled, *coarse_options], others
+                    )
+                if self.template_comparison:
+                    best = next(
+                        self.options(family, refined, reg, seeds[:5], others), None
+                    )
+                if self.template_comparison and (
+                    best is None or choice["prior_postures"]
+                ):
                     from .tabletop_grips import patch_candidates
 
                     for gaps, card, targets in patch_candidates(
-                        self, name, refined, seeds, others
+                        self, family, refined, seeds[:6], others
                     )[:24]:
                         for initial in (self.arm, self.mid_arm):
                             try:
@@ -657,6 +766,43 @@ class Controller:
             else "no clear arm path to wrist view"
         )
 
+    def begin_lift(self, surface, seed):
+        from .tabletop_tracking import initialize
+
+        self.tracks = {
+            role: initialize(self.snapshot(role, "before_lift"), self.io, surface.world)
+            for role in ("head", "wrist")
+        }
+        names = self.io.model.hand_names["right"]
+        self.grip_guard = {
+            "base": self.hand.copy(),
+            "extra": np.zeros_like(self.hand),
+            "axis": np.clip(
+                np.array(seed["q_touch"]) - np.array(seed["q_open"]), -0.5, 0.5
+            ),
+            "digits": [
+                [
+                    i
+                    for i, n in enumerate(names)
+                    if "_" + d + "_" in n and n.endswith(("_FE", "PIP", "DIP", "_IP"))
+                ]
+                for d in ("thumb", "index", "middle", "ring", "pinky")
+            ],
+        }
+
+    def maintained_hand(self):
+        guard = self.grip_guard
+        if guard is None:
+            return self.hand
+        actual = self.io.q()[self.io.hand]
+        for ids in guard["digits"]:
+            if np.max(np.abs(self.hand[ids] - actual[ids])) < 0.045:
+                guard["extra"][ids] += np.clip(guard["axis"][ids], -0.18, 0.18) * 0.012
+        return np.clip(
+            guard["base"] + np.clip(guard["extra"], -0.15, 0.15),
+            *self.io.model.limits["right"].T,
+        )
+
     def vote(self, surface, pose, palm0, color, tag):
         held = self.io.fk(PALM) @ np.linalg.inv(palm0) @ pose
         votes = {}
@@ -665,6 +811,13 @@ class Controller:
             votes[role] = match_height(
                 frame, self.io, self.table, surface.local, pose, held, color
             )
+            if self.tracks:
+                from .tabletop_tracking import measure
+
+                delta = self.io.fk(PALM) @ np.linalg.inv(palm0)
+                votes[role].update(
+                    measure(self.tracks.get(role), frame, self.io, surface.world, delta)
+                )
         carried = sum(x.get("carried_pixels", 0) for x in votes.values())
         static = sum(x.get("static_pixels", 0) for x in votes.values())
         vote = "unknown"
@@ -672,6 +825,48 @@ class Controller:
             vote = "carried"
         if static >= 12 and static > 1.7 * carried:
             vote = "on_table"
+        if tag.startswith("test_observation") and not self.template_comparison:
+            measured = [
+                v
+                for v in votes.values()
+                if v.get("height_support", 0) >= 24
+                and v.get("height_margin_m", 0) >= 0.0009
+            ]
+            if (
+                measured
+                and all(v["visible_lift_m"] >= 0.007 for v in measured)
+                and not any(
+                    v.get("static_pixels", 0) > 2 * max(v.get("carried_pixels", 0), 1)
+                    and v.get("visible_lift_m", 0) < 0.005
+                    for v in votes.values()
+                )
+            ):
+                vote = "carried"
+        tracks = [v for v in votes.values() if v.get("texture_inliers", 0) >= 5]
+        if tracks:
+            good = (
+                (0.007, 0.0025)
+                if tag.startswith("test_observation")
+                else (self.lift_height, self.lift_height)
+            )
+            if all(
+                v["tracked_rise_m"] >= good[0] and v["tracked_bottom_rise_m"] >= good[1]
+                for v in tracks
+            ):
+                vote = "carried"
+            elif all(
+                abs(v["tracked_rise_m"]) < 0.004
+                and abs(v["tracked_bottom_rise_m"]) < 0.004
+                for v in tracks
+            ):
+                vote = "on_table"
+            elif not tag.startswith("test_observation") and any(
+                min(v["tracked_bottom_rise_m"], v["tracked_rise_m"])
+                < self.lift_height - 0.003
+                for v in tracks
+            ):
+                vote = "unknown"
+        self.lift_views = votes
         self.event(tag, vote=vote, views=votes)
         return vote
 
@@ -694,20 +889,46 @@ class Controller:
                 visual_center=surface.world.mean(0).tolist(),
             )
             close_started = True
-            self.closing(grasp, qt, 0.72)
-            self.closing(tight, qc, 0.46)
-            # Allow loaded fingers limited additional flexion only while position feedback lags.
-            # Positive flexion is bounded by the commanded posture and each actuator's native limits.
-            actual = self.io.q()[self.io.hand]
-            desired = self.hand.copy()
-            lag = desired[self.flex] - actual[self.flex]
-            push = np.where(
-                (lag > 0.035) & (lag < 0.30), np.minimum(lag * 0.32, 0.045), 0.0
-            )
-            desired[self.flex] += push
-            self.command([self.arm, self.arm], desired, 0.18, guard=True)
-            self.hold(0.22)
+            if seed["origin"] == "wrist_handle_cross_sections":
+                from .tabletop_handle import seat
+
+                self.closing(grasp, qt, 0.92)
+                surface, pose = seat(self, surface, pose, qt)
+            elif seed["origin"] == "wrist_mesh_joint_fit":
+                from .tabletop_handle import reobserve
+                from .tabletop_meshfit import close_from_mesh
+
+                # First surround the measured sides with an open hand. Moving a closed
+                # thumb into an unsupported object can push it away from the fingers.
+                self.closing(poses["open_seat"], qo, 0.38)
+                self.closing(grasp, qt, 0.50)
+                new_surface, new_pose = reobserve(
+                    self, surface, pose, tag="mesh_seated"
+                )
+                movement = new_pose @ np.linalg.inv(pose)
+                for site in seed["fit_sites"]:
+                    site["goal"] = movement[:3, :3] @ site["goal"] + movement[:3, 3]
+                    site["normal"] = movement[:3, :3] @ site["normal"]
+                surface, pose = new_surface, new_pose
+                close_from_mesh(self, seed)
+            else:
+                self.closing(grasp, qt, 0.72)
+                self.closing(tight, qc, 0.46)
+                # Allow loaded fingers limited additional flexion only while position feedback lags.
+                # Positive flexion is bounded by the commanded posture and each actuator's native limits.
+                actual = self.io.q()[self.io.hand]
+                desired = self.hand.copy()
+                lag = desired[self.flex] - actual[self.flex]
+                push = np.where(
+                    (lag > 0.035) & (lag < 0.30), np.minimum(lag * 0.32, 0.045), 0.0
+                )
+                desired[self.flex] += push
+                self.command([self.arm, self.arm], desired, 0.18, guard=True)
+                self.hold(0.22)
             palm0 = self.io.fk(PALM)
+            first = palm0
+            if not self.template_comparison:
+                self.begin_lift(surface, seed)
             self.event("test_lift")
             self.move(shifted(palm0, [0, 0, 0.022]), self.hand, 0.44)
             self.hold(0.16)
@@ -721,7 +942,38 @@ class Controller:
                 )
             if verdict != "carried":
                 return verdict
-            self.move(shifted(palm0, [0, 0, 0.102]), self.hand, 0.78)
+            self.move(shifted(palm0, [0, 0, self.lift_height + 0.009]), self.hand, 0.65)
+            if not self.template_comparison:
+                # A compliant object can tilt or slip a little even as it follows the hand.
+                # Use the observed motion of its bottom before starting the hold clock.
+                for _ in range(2):
+                    self.hold(0.12)
+                    self.vote(
+                        surface,
+                        pose,
+                        palm0,
+                        observed["color"],
+                        "measure_lift_clearance",
+                    )
+                    estimates = [
+                        min(v["tracked_rise_m"], v["tracked_bottom_rise_m"])
+                        for v in self.lift_views.values()
+                        if v.get("texture_inliers", 0) >= 5
+                    ]
+                    if (
+                        not estimates
+                        or min(estimates) < 0.45 * self.lift_height
+                        or min(estimates) >= self.lift_height + 0.005
+                    ):
+                        break
+                    rise = min(0.024, self.lift_height + 0.010 - min(estimates))
+                    current = self.io.fk(PALM)
+                    self.event(
+                        "correct_lift_clearance",
+                        measured_rise_m=round(min(estimates), 4),
+                        correction_m=round(rise, 4),
+                    )
+                    self.move(shifted(current, [0, 0, rise]), self.hand, 0.38)
             self.event("hold_start")
             verdicts = []
             for i in range(4):
@@ -741,6 +993,8 @@ class Controller:
             )
         finally:
             if close_started:
+                self.grip_guard = None
+                self.tracks = {}
                 self.event("lower_and_release")
                 current = self.io.fk(PALM)
                 if current[2, 3] > first[2, 3] + 0.011:
@@ -770,7 +1024,7 @@ class Controller:
         target = self.ik.solve(goal, start)
         self.command([start, target], hand, seconds, guard=True)
 
-    def execute(self):
+    def execute(self, targets=None):
         (self.out / "observations").mkdir()
         self.flex = np.array(
             [
@@ -781,7 +1035,9 @@ class Controller:
         )
         self.survey()
         anchors = {name: dict(obs) for name, obs in self.seen.items()}
-        pending = list(self.library)
+        pending = list(self.library if targets is None else dict.fromkeys(targets))
+        if set(pending) - set(self.library):
+            raise ValueError("target absent from the known object library")
         while pending:
             if self.results:
                 self.leave_low_pose()
@@ -867,5 +1123,15 @@ class Controller:
         self.event("episode_end")
 
 
-def run(io, library, out):
-    Controller(io, library, out).execute()
+def run(
+    io,
+    library,
+    out,
+    targets=None,
+    template_comparison=False,
+    shared=None,
+    lift_height=0.05,
+):
+    Controller(io, library, out, template_comparison, shared, lift_height).execute(
+        targets
+    )

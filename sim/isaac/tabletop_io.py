@@ -19,6 +19,15 @@ class PhysicsRecording:
         self.right = [
             i for i, name in enumerate(scene.contact_names) if name.startswith("right_")
         ]
+        self.digit_links = [
+            [
+                j
+                for j, i in enumerate(self.right)
+                if scene.contact_names[i].startswith("right_" + d + "_")
+                and scene.contact_names[i].endswith(("_PP", "_MP", "_DP", "_elastomer"))
+            ]
+            for d in ("thumb", "index", "middle", "ring", "pinky")
+        ]
 
     def record(self):
         import torch
@@ -30,12 +39,14 @@ class PhysicsRecording:
         ]
         # Keep one independent sample per physics tick. A batched host copy avoids
         # synchronizing the simulator once per body and finger on every tick.
+        magnitudes = forces.norm(dim=-1)
         sample = torch.cat(
             [
                 *(o.data.root_state_w[0, :7] for o in s.objects.values()),
                 s.robot.data.body_pos_w[0, i],
                 s.robot.data.body_quat_w[0, i],
-                forces.norm(dim=-1).sum(dim=0),
+                magnitudes.sum(dim=0),
+                *(magnitudes[ids].sum(dim=0) for ids in self.digit_links),
                 s.robot.data.joint_pos[0],
             ]
         )
@@ -61,7 +72,9 @@ class PhysicsRecording:
             pose_wxyz=rows[:, :end].reshape(-1, n, 7),
             palm_wxyz=rows[:, end : end + 7],
             hand_load_N=rows[:, end + 7 : end + 7 + n],
-            q_measured=rows[:, end + 7 + n :],
+            digit_load_N=rows[:, end + 7 + n : end + 7 + 6 * n].reshape(-1, 5, n),
+            digit_names=["thumb", "index", "middle", "ring", "pinky"],
+            q_measured=rows[:, end + 7 + 6 * n :],
             dt=self.scene.config["physics_dt"],
             table_z=self.table,
         )

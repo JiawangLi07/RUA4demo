@@ -102,6 +102,13 @@ def test_offline_score_requires_an_executed_closure_and_two_loaded_seconds(
     result = tabletop_score.evaluate(scene, tmp_path)
     assert result["stable"] == 1 and result["closed"] == 1
     assert not result["per_object"]["test"][0]["closure"]
+    # A 6 cm raise clears the current 5 cm acceptance height, but misses the earlier goal.
+    obj[140:390, 0, 2] -= 0.045
+    palm[140:390, 2] -= 0.045
+    np.savez(tmp_path / "physics_audit.npz", **recording)
+    (tmp_path / "trial_settings.json").write_text(json.dumps({"lift_height_m": 0.05}))
+    assert tabletop_score.evaluate(scene, tmp_path)["stable"] == 1
+    assert tabletop_score.evaluate(scene, tmp_path, 0.09)["stable"] == 0
     forces[140:390, 0] = 0.0
     np.savez(tmp_path / "physics_audit.npz", **recording)
     assert tabletop_score.evaluate(scene, tmp_path)["stable"] == 0

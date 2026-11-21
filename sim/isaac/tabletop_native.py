@@ -16,6 +16,22 @@ def main():
     parser.add_argument("--library", type=Path)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--observe-only", action="store_true")
+    parser.add_argument(
+        "--lift-height-m",
+        type=float,
+        default=0.05,
+        help="required object rise and bottom clearance",
+    )
+    parser.add_argument(
+        "--target",
+        action="append",
+        help="visit a named target while all scene objects remain active",
+    )
+    parser.add_argument(
+        "--template-comparison",
+        action="store_true",
+        help="replay the fixed-posture comparison",
+    )
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
     out = args.out.resolve()
@@ -44,9 +60,24 @@ def main():
         # The auditor has no return channel into the controller.
         try:
             if not args.observe_only:
+                from .tabletop_catalog import load_registry
                 from .tabletop_control import run
 
-                run(io, json.loads(args.library.read_bytes()), out)
+                if args.library is None:
+                    parser.error("--library is required for a grasp trial")
+                spec, shared = load_registry(args.library, args.template_comparison)
+                (out / "trial_settings.json").write_text(
+                    json.dumps({"lift_height_m": args.lift_height_m})
+                )
+                run(
+                    io,
+                    spec,
+                    out,
+                    args.target,
+                    args.template_comparison,
+                    shared,
+                    args.lift_height_m,
+                )
         finally:
             audit.save()
             (out / "frames.json").write_text(json.dumps(scene.frame_times))
