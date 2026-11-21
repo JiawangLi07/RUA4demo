@@ -6,7 +6,7 @@ import pytest
 
 from sim.isaac.paths import RIGHT_JOINTS
 from sim.isaac.tabletop_control import Controller
-from sim.isaac.tabletop_lightning import LightningBank
+from sim.isaac.tabletop_lightning import LightningBank, central_palm_samples
 from sim.isaac.tabletop_lightning_banks import merge
 
 
@@ -101,3 +101,76 @@ def test_lightning_registry_needs_only_metric_mesh(tmp_path):
         json.dumps({"schema": "rua.tabletop-geometries.v1", "objects": objects})
     )
     assert load_registry(registry, load_postures=False) == (objects, None)
+
+
+def test_canonical_hand_allows_upright_park_and_rejects_inverted_transit():
+    from scipy.spatial.transform import Rotation
+
+    controller = Controller.__new__(Controller)
+    controller.lightning = object()
+    palm = np.eye(4)
+    assert controller.approach_orientation_clear(palm)
+    palm[:3, :3] = Rotation.from_euler("x", 65, degrees=True).as_matrix()
+    assert controller.approach_orientation_clear(palm)
+    palm[:3, :3] = Rotation.from_euler("x", -65, degrees=True).as_matrix()
+    assert not controller.approach_orientation_clear(palm)
+    palm[:3, :3] = Rotation.from_euler("x", 150, degrees=True).as_matrix()
+    assert not controller.approach_orientation_clear(palm)
+
+
+def test_palm_gap_samples_exclude_back_and_flange():
+    from itertools import product
+
+    cad = np.array(list(product((-0.008, 0.011), (-0.04, 0.04), (0.0, 0.10))))
+    samples = central_palm_samples(cad)
+    assert len(samples) >= 9
+    assert np.allclose(samples[:, 0], 0.011)
+    assert np.max(np.abs(samples[:, 1])) < 0.024
+    assert samples[:, 2].min() > 0.030 and samples[:, 2].max() < 0.082
+
+
+def test_static_palm_contact_joins_native_contact_search_in_object_frame():
+    from scipy.spatial.transform import Rotation
+    from sim.isaac.tabletop_lightning_generate import palm_condition_in_object_frame
+
+    poses = np.eye(4)[None]
+    poses[0, :3, :3] = Rotation.from_euler("zy", [73, -38], degrees=True).as_matrix()
+    poses[0, :3, 3] = [0.07, 0.019, -0.032]
+    obj_point = np.array([[[0.008, -0.037, 0.028]]])
+    obj_out = np.array([[[0, -1.0, 0]]])
+    rot = poses[0, :3, :3]
+    condition = dict(
+        extra_contact_pos=obj_point @ rot.T + poses[0, :3, 3],
+        extra_contact_normal=-obj_out @ rot.T,
+        extra_contact_mask=np.ones((1, 1)),
+    )
+    out = palm_condition_in_object_frame(poses, condition)
+    assert np.allclose(out["extra_contact_pos"], obj_point)
+    assert np.allclose(out["extra_contact_normal"], -obj_out)
+
+
+def test_yaw_reprojection_compares_native_inward_normal_to_scan_surface():
+    from scipy.spatial.transform import Rotation
+    from sim.isaac.tabletop_lightning_yaw import yaw_candidates
+
+    angle = np.arange(36) * np.pi / 18
+    normals = np.c_[np.cos(angle), np.sin(angle), np.zeros_like(angle)]
+    mesh = SimpleNamespace(vertices=0.032 * normals, vertex_normals=normals)
+    indices = [0, 9, 18, 27]
+    pose = np.eye(4)
+    pose[:3, :3] = Rotation.from_euler("x", -90, degrees=True).as_matrix()
+    pose[:3, 3] = [0.055, 0.012, 0.062]
+    seeds = dict(
+        object_pose=pose[None],
+        contact_link_id=np.array([[0, 1, 2, 3]]),
+        link_names=np.array(["right_thumb_elastomer", "index", "middle", "ring"]),
+        target_pos=(mesh.vertices[indices] @ pose[:3, :3].T + pose[:3, 3])[None],
+        target_normal=(-normals[indices] @ pose[:3, :3].T)[None],
+    )
+    candidates = list(yaw_candidates(mesh, seeds, np.zeros((1, 3)), 90))
+    assert [row[1] for row in candidates] == [90, 180, 270]
+    for _, _, rotated, points, outward, *_ in candidates:
+        assert np.allclose(
+            points @ rotated[:3, :3].T + rotated[:3, 3], seeds["target_pos"][0]
+        )
+        assert np.allclose(-outward @ rotated[:3, :3].T, seeds["target_normal"][0])

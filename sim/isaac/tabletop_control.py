@@ -291,7 +291,7 @@ class Controller:
         return self.vertices_clear(pose, self.shape(hand), others)
 
     def vertices_clear(self, pose, local_vertices, others):
-        if not self.fixture_clear(pose):
+        if not self.approach_orientation_clear(pose) or not self.fixture_clear(pose):
             return False
         vertices = local_vertices @ pose[:3, :3].T + pose[:3, 3]
         if vertices[:, 2].min() < self.table - 0.0015:
@@ -308,12 +308,24 @@ class Controller:
             for vertices in getattr(self.io.model, "fixture_palm", {}).values()
         )
 
+    def approach_orientation_clear(self, palm):
+        if self.lightning is None:
+            return True
+        # The parked hands have fingers upright and the radial axis horizontal.
+        # Allow a small tracking tolerance from park and enforce the same half-space
+        # along Cartesian and fallback joint-space paths, including local retries.
+        return bool(palm[2, 1] >= -0.055 and palm[2, 2] >= -0.20)
+
     def command(self, joints, hand, duration):
         """Interpolate the planned joint path by arc length and keep the final hand target."""
         io = self.io
         start = self.hand.copy()
         hand = np.clip(hand, *io.model.limits["right"].T)
         joints = np.asarray(joints)
+        if self.lightning is not None and not swept_clear(
+            joints, lambda arm, _: self.approach_orientation_clear(self.ik.fk(arm))
+        ):
+            raise NoPath("approach would roll the thumb side down")
         if (
             self.table is not None
             and getattr(io.model, "fixture_palm", {})
@@ -1084,7 +1096,7 @@ class Controller:
                 seat = shifted(grasp, -0.009 * grasp[:3, 0])
                 self.closing(seat, qo, 0.48)
                 self.closing(grasp, qt, 0.65)
-                self.closing(grasp, qc, 0.42)
+                self.closing(tight, qc, 0.42)
                 self.hold(0.20)
             elif seed["origin"] == "wrist_handle_cross_sections":
                 from .tabletop_handle import seat, surround_handle

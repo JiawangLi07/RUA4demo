@@ -132,6 +132,19 @@ def evaluate(scene, directory, lift_height=None):
                 row["predicted_thumb_height_difference_m"] = phases["selected"][
                     "thumb_above_mean_fingers_m"
                 ]
+                if "approach" in phases:
+                    u = tick(phases["approach"]["time"])
+                    v = tick(release_time)
+                    rot = Rotation.from_quat(palm[u : v + 1, [4, 5, 6, 3]])
+                    radial_z = rot.as_matrix()[:, 2, 1] * (1 if side == "right" else -1)
+                    park = Rotation.from_quat(palm[0, [4, 5, 6, 3]])
+                    row["minimum_radial_axis_world_z"] = round(float(radial_z.min()), 4)
+                    row["minimum_wrist_to_knuckles_world_z"] = round(
+                        float(rot.as_matrix()[:, 2, 2].min()), 4
+                    )
+                    row["maximum_turn_from_park_deg"] = round(
+                        float(np.rad2deg((park.inv() * rot).magnitude().max())), 2
+                    )
             travel = np.linalg.norm(
                 root[first : last + 1, :, :3] - root[first, :, :3], axis=2
             ).max(axis=0)

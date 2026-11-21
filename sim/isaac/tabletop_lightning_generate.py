@@ -101,7 +101,65 @@ def prepare(api, torch, args):
     )
 
 
+def side_placements(torch, field, tree, static, pts, normals, obj, args):
+    """Seed the native contact search at measured side walls with the radial side up."""
+    from lygra.pipeline.module.collision import batch_object_hand_collision_check
+
+    def unit(x):
+        return x / torch.linalg.vector_norm(x, dim=-1, keepdim=True).clamp_min(1e-7)
+
+    def basis(x, up, twist):
+        y = unit(up - (x * up).sum(1, keepdim=True) * x)
+        z = torch.linalg.cross(x, y)
+        y = torch.cos(twist) * y + torch.sin(twist) * z
+        return torch.stack((x, y, torch.linalg.cross(x, y)), dim=-1)
+
+    low, high = obj.mesh.vertices[:, 2].min(), obj.mesh.vertices[:, 2].max()
+    rel_z = (pts[:, 2] - low) / max(high - low, 1e-6)
+    wall = torch.where((normals[:, 2].abs() < 0.45) & (rel_z > 0.23) & (rel_z < 0.75))[
+        0
+    ]
+    if not len(wall):
+        return pts.new_empty((0, 4, 4)), {}
+    n = args.outer * 3
+    ix = wall[torch.randint(len(wall), (n,), device=pts.device)]
+    site = torch.as_tensor(
+        field.sample_static_contact_geometry(n), device=pts.device, dtype=pts.dtype
+    )
+    hand = basis(unit(site[:, 3:]), pts.new_tensor([0, 1, 0]), pts.new_zeros((n, 1)))
+    twist = (torch.rand((n, 1), device=pts.device) - 0.5) * 1.40
+    body = basis(-unit(normals[ix]), pts.new_tensor([0, 0, 1]), twist)
+    rot = hand @ body.transpose(1, 2)
+    # A clearance of a few millimetres accommodates scan noise. The runtime
+    # independently rechecks the palm patch and controls the final seating travel.
+    stand_off = torch.rand((n, 1), device=pts.device) * 0.0045
+    pos = (
+        site[:, :3] + stand_off * unit(site[:, 3:]) - (rot @ pts[ix, :, None])[:, :, 0]
+    )
+    pose = torch.eye(4, device=pts.device, dtype=pts.dtype).repeat(n, 1, 1)
+    pose[:, :3, :3], pose[:, :3, 3] = rot, pos
+    inv = torch.linalg.inv(pose)
+    mount = torch.as_tensor(args.fixture, device=pts.device, dtype=pts.dtype)
+    clear = (inv[:, 2, :3] @ mount.T).amin(1) + inv[:, 2, 3] > low + 0.004
+    clear &= (inv[:, 2, 1] >= 0.25) & (inv[:, 2, 2] >= -0.15)
+    idx = torch.where(clear)[0]
+    if len(idx):
+        points = pts @ rot[idx].transpose(1, 2) + pos[idx, None]
+        idx = idx[batch_object_hand_collision_check(tree, points, mesh=static)][
+            : args.outer
+        ]
+    return pose[idx], {
+        "extra_contact_pos": (site[:, :3] + stand_off * unit(site[:, 3:]))[idx, None],
+        "extra_contact_normal": site[idx, None, 3:],
+        "extra_contact_mask": torch.ones(
+            (len(idx), 1), device=pts.device, dtype=pts.dtype
+        ),
+    }
+
+
 def sample_placements(api, torch, robot, field, tree, static, pts, normals, obj, args):
+    if args.side_placements:
+        return side_placements(torch, field, tree, static, pts, normals, obj, args)
     proposal_args = api.get_object_pose_sampling_args("canonical", robot)
     if not args.tabletop:
         return api.sample_object_pose(
@@ -127,12 +185,19 @@ def sample_placements(api, torch, robot, field, tree, static, pts, normals, obj,
             tree,
             static,
             proposal_args,
-            use_static_prob=0.8 if args.power_contact else 0.5,
+            use_static_prob=1.0
+            if args.upright_wrap
+            else (0.8 if args.power_contact else 0.5),
         )
         sample = sample @ chart
         inverse = torch.linalg.inv(sample)
         floor = (inverse[:, 2, :3] @ fixture.T).amin(1) + inverse[:, 2, 3]
         good = floor > bottom + 0.004
+        if args.upright_wrap:
+            # In the canonical Sharpa frame +Y runs from the little finger to
+            # the index, +Z runs from the wrist to the knuckles. The mirrored
+            # left mesh uses the same canonical hand; table height is unchanged.
+            good &= (inverse[:, 2, 1] >= 0.25) & (inverse[:, 2, 2] >= -0.15)
         if not good.any():
             continue
         poses.append(sample[good])
@@ -145,6 +210,19 @@ def sample_placements(api, torch, robot, field, tree, static, pts, normals, obj,
     return torch.cat(poses)[: args.outer], {
         k: torch.cat(v)[: args.outer] for k, v in conditions.items()
     }
+
+
+def palm_condition_in_object_frame(poses, condition):
+    # The placement sampler reports a point and outward normal on the palm.
+    # Native contact search evaluates object-frame points. Its v1 project()
+    # negates the object's outer normals, yielding directions into the object.
+    # The outward palm normal already points into the object at contact.
+    r = poses[:, :3, :3]
+    return dict(
+        condition,
+        extra_contact_pos=(condition["extra_contact_pos"] - poses[:, None, :3, 3]) @ r,
+        extra_contact_normal=condition["extra_contact_normal"] @ r,
+    )
 
 
 def batch(api, torch, ctx, obj, args, ncontact):
@@ -173,6 +251,8 @@ def batch(api, torch, ctx, obj, args, ncontact):
     log = {"placements": len(poses), "requested_digits": ncontact}
     if not len(poses):
         return {}, log
+    if "extra_contact_pos" in condition:
+        condition = palm_condition_in_object_frame(poses, condition)
     hits = api.batch_object_all_contact_fields_interaction(pts, normals, poses, accel)
     hit = (hits >= 0).int()
     try:
@@ -190,6 +270,12 @@ def batch(api, torch, ctx, obj, args, ncontact):
         if error.code != -1:
             raise
         return {}, dict(log, domains=0)
+    except NameError as error:
+        # The pinned v1 contact_collection also calls sys.exit on an empty
+        # independent set without importing sys. Preserve other NameErrors.
+        if error.name != "sys":
+            raise
+        return {}, dict(log, domains=0)
     pos, normal, idx, poses, link, condition, outer = domain
     log.update(domains=len(poses), actual_digits=link.shape[-1])
     if not len(poses):
@@ -205,6 +291,8 @@ def batch(api, torch, ctx, obj, args, ncontact):
         condition=condition,
         zo_lr=5 * (obj.get_area() / args.points) ** 0.5,
     )
+    if not len(goals):
+        return {}, dict(log, optimized_contacts=0)
     contact, local = field.sample_contact_ids(
         interaction_matrix=hit[outer],
         interaction_matrix_hand_point_idx=hits[outer],
@@ -285,7 +373,21 @@ def main():
         help="sample diverse contact tangents above the registered mesh support plane",
     )
     p.add_argument("--contacts", nargs="+", type=int, default=[5, 4])
+    p.add_argument(
+        "--upright-wrap",
+        action="store_true",
+        help="use static palm contact on every placement and sample thumb-side-up grasps",
+    )
+    p.add_argument(
+        "--side-placements",
+        action="store_true",
+        help="seed the native solver from upright registered side-wall contacts",
+    )
     a = p.parse_args()
+    if a.side_placements and not a.upright_wrap:
+        p.error("--side-placements needs --upright-wrap")
+    if a.upright_wrap and not (a.tabletop and a.power_contact):
+        p.error("--upright-wrap needs --tabletop and --power-contact")
     if a.tabletop:
         a.fixture = np.load(a.hand.parent / "palm_and_fixture.npy", allow_pickle=False)
     sys.path.insert(0, str(a.upstream.resolve()))
@@ -355,6 +457,9 @@ def main():
                 points=a.points,
                 tabletop=a.tabletop,
                 power_contact=a.power_contact,
+                static_contact_frame="object_inward",
+                upright_wrap=a.upright_wrap,
+                side_placements=a.side_placements,
                 candidates=len(values["q"]),
                 batches=attempts,
             )

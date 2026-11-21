@@ -5,9 +5,34 @@ import json
 from pathlib import Path
 
 import numpy as np
+from scipy.spatial import ConvexHull
 
 from .paths import RIGHT_JOINTS
 from .tabletop_control import NoPath, shifted
+
+
+def central_palm_samples(vertices):
+    """Sample the front of the metacarpal plate, away from the flange and knuckles."""
+    hull = ConvexHull(vertices)
+    front = vertices[hull.simplices[hull.equations[:, 0] > 0.65]]
+    samples = []
+    for a in range(9):
+        for b in range(9 - a):
+            samples.extend(
+                (a * front[:, 0] + b * front[:, 1] + (8 - a - b) * front[:, 2]) / 8
+            )
+    points = np.unique(np.round(samples, 5), axis=0)
+    lo, hi = vertices.min(0), vertices.max(0)
+    rel = (points - lo) / np.maximum(hi - lo, 1e-6)
+    patch = points[
+        (rel[:, 1] > 0.20)
+        & (rel[:, 1] < 0.80)
+        & (rel[:, 2] > 0.30)
+        & (rel[:, 2] < 0.82)
+    ]
+    if not len(patch):
+        raise ValueError("no working surface on Sharpa palm CAD")
+    return patch[:: max(1, len(patch) // 120)]
 
 
 class LightningBank:
@@ -135,6 +160,32 @@ class LightningBank:
             data["pad_centers"] = np.asarray(centers)
         pad_z = np.einsum("ni,nki->nk", poses[:, 2, :3], data["pad_centers"])
         pad_dz = pad_z[:, 0] - pad_z[:, 1:].mean(1)
+        if "palm_gaps" not in data:
+            patch = central_palm_samples(ctrl.io.model.hand_support["right_hand_C_MC"])
+            obj_from_palm = np.linalg.inv(data["object_pose"])
+            samples = (
+                np.einsum("nij,pj->npi", obj_from_palm[:, :3, :3], patch)
+                + obj_from_palm[:, None, :3, 3]
+            )
+            # A patch fraction rejects candidates grazing the edge with a single vertex.
+            gaps = surface.tree.query(samples)[0]
+            data["palm_gaps"] = np.quantile(gaps, 0.15, axis=1)
+        palm_gap = data["palm_gaps"]
+        digits = np.stack(
+            [
+                (
+                    np.char.startswith(links.astype(str), "right_" + d + "_") & present
+                ).any(1)
+                for d in ("thumb", "index", "middle", "ring", "pinky")
+            ],
+            axis=1,
+        )
+        # A tall body with room for the four-finger span can accept a power grasp.
+        span = np.ptp(surface.local, axis=0)
+        power_body = span[2] >= 0.090 and np.min(span[:2]) >= 0.042
+        park_rot = ctrl.ik.fk(ctrl.reference_arm)[:3, :3]
+        trace = np.einsum("nij,ij->n", poses[:, :3, :3], park_rot)
+        turn = np.arccos(np.clip((trace - 1) / 2, -1, 1))
         # Contact normals on opposite sides and a palm close to the surface carry
         # more weight than the number of candidate fingertip contacts alone.
         normal = data["target_normal"]
@@ -152,6 +203,8 @@ class LightningBank:
             + 2.0 * thumb.any(1)
             + 0.7 * fingers.sum(1)
             + opposing
+            - 1.2 * turn
+            - 65 * palm_gap
             - 22 * np.maximum(0, -thumb_dz + 0.003)
             - 45 * np.maximum(0, -pad_dz + 0.004)
             - 0.45 * abs(hand_z)
@@ -174,6 +227,43 @@ class LightningBank:
             "open_approach": 0,
             "arm_reachable": 0,
         }
+        # The right and mirrored-left controller both use a canonical right palm.
+        # +Y is radial (pinky towards index), +Z points from wrist to knuckles.
+        eligible &= (
+            (poses[:, 2, 1] >= 0.25)
+            & (poses[:, 2, 2] >= -0.15)
+            & (pad_dz >= 0.004)
+            & thumb.any(1)
+        )
+        counts["thumb_up"] = int(eligible.sum())
+        supported = digits.copy()
+        if power_body:
+            # Upstream assigns unrequested fingers and collision-checks them.
+            # Credit an unassigned digit only if its pad or inner phalanx actually
+            # approaches this object's measured surface at the returned native q.
+            inv = np.linalg.inv(data["object_pose"])
+            for i in np.flatnonzero(eligible & (palm_gap <= 0.012)):
+                for j, digit in enumerate(("index", "middle", "ring", "pinky"), 1):
+                    if digits[i, j]:
+                        continue
+                    for suffix in ("elastomer", "MP"):
+                        link = f"right_{digit}_{suffix}"
+                        t, _ = ctrl.hand_contacts.link(link, inv[i], data["q"][i])
+                        vertices = ctrl.io.model.hand_support[link]
+                        points = vertices @ t[:3, :3].T + t[:3, 3]
+                        if np.quantile(surface.tree.query(points)[0], 0.05) <= 0.006:
+                            supported[i, j] = True
+                            break
+        eligible &= digits.sum(1) >= 3
+        # Prefer a full wrap whenever the arm can execute it. Narrow surfaces
+        # and obstructed approaches can still support an upright opposed grip.
+        tier = np.ones(len(poses), dtype=int)
+        if power_body:
+            close_palm = palm_gap <= 0.012
+            tier[close_palm & (supported.sum(1) >= 4)] = 2
+            tier[close_palm & supported.all(1)] = 3
+        counts["nominal_full_wrap"] = int(np.count_nonzero(eligible & (tier == 3)))
+        counts["contact_geometry"] = int(eligible.sum())
         excluded = {int(s.split("-")[-1]) for s in previous if s.startswith("LG-")}
 
         def distinct(i):
@@ -190,10 +280,13 @@ class LightningBank:
             [n.endswith(("_FE", "_IP", "_PIP", "_DIP")) for n in RIGHT_JOINTS]
         )
         choices = np.flatnonzero(eligible)
-        order = choices[np.argsort(-score[choices], kind="stable")]
+        order = choices[np.lexsort((-score[choices], -tier[choices]))]
         reached = []
+        approach_checks = np.zeros(4, dtype=int)
         for i in order:
-            if not distinct(i):
+            if reached and tier[i] < tier[reached[0][1]]:
+                break
+            if approach_checks[tier[i]] >= 110 or not distinct(i):
                 continue
             palm, q = poses[i], data["q"][i].astype(float)
             if (
@@ -236,8 +329,7 @@ class LightningBank:
             if not pre_options:
                 continue
             counts["open_approach"] += 1
-            if counts["open_approach"] > 110:
-                break
+            approach_checks[tier[i]] += 1
             for pre in pre_options:
                 solved = None
                 ik_seeds = [ctrl.arm, ctrl.mid_arm]
@@ -272,6 +364,16 @@ class LightningBank:
         tight[flex] = np.clip(q[flex] + 0.15, lo[flex], hi[flex])
         posture = f"LG-{i}"
         ctrl.hints[pre.round(5).tobytes()] = solved
+        # The native pose is the initial contact target. Use a separate, bounded
+        # seating command along the measured palm normal to take up surface clearance.
+        seat_depth = (
+            min(float(palm_gap[i]) + 0.0015, 0.005)
+            if power_body and palm_gap[i] <= 0.012
+            else 0.0
+        )
+        seated = shifted(palm, seat_depth * palm[:3, 0])
+        if not ctrl.clear(seated, tight, others):
+            seated, seat_depth = palm, 0.0
         ctrl.event(
             "selected",
             origin="lightning_grasp",
@@ -286,6 +388,15 @@ class LightningBank:
             ],
             thumb_above_mean_fingers_m=float(thumb_dz[i]) if thumb[i].any() else None,
             predicted_thumb_pad_above_four_m=float(pad_dz[i]),
+            radial_axis_world_z=float(palm[2, 1]),
+            wrist_to_knuckles_world_z=float(palm[2, 2]),
+            turn_from_park_deg=float(np.rad2deg(turn[i])),
+            central_palm_gap_m=float(palm_gap[i]),
+            palm_seat_m=seat_depth,
+            contact_tier=("multi_digit", "palm_and_three", "palm_and_four")[
+                tier[i] - 1
+            ],
+            supported_finger_geometry=supported[i].tolist(),
             bank_sha256=receipt["bank_sha256"],
             rgbd_object_pose=reg.tolist(),
             palm_grasp=palm.tolist(),
@@ -300,4 +411,4 @@ class LightningBank:
             q_open=open_q,
             q_touch=q,
             q_tight=tight,
-        ), dict(pre=pre, grasp=palm, tight=palm)
+        ), dict(pre=pre, grasp=palm, tight=seated)
