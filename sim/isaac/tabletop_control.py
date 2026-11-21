@@ -115,14 +115,25 @@ class ArmIK:
 
 class Controller:
     def __init__(
-        self, io, library, out, template_comparison=False, shared=None, lift_height=0.05
+        self,
+        io,
+        library,
+        out,
+        template_comparison=False,
+        shared=None,
+        lift_height=0.05,
+        lightning=None,
     ):
         self.io, self.library, self.out = io, library, out
-        self.models = Models(library)
+        self.side = getattr(io, "side", "right")
+        self.models = Models(library, mirror=self.side == "left")
+        self.lightning = lightning
         self.shared = shared
         if not 0.03 <= lift_height <= 0.20:
             raise ValueError("expected a lift goal between 0.03 and 0.20 metres")
         self.lift_height = lift_height
+        # Allow for a few millimetres of object settling during continuous closure.
+        self.lift_travel = lift_height + (0.017 if lightning is not None else 0.009)
         from .tabletop_meshfit import HandContacts
 
         self.hand_contacts = HandContacts(io)
@@ -146,7 +157,10 @@ class Controller:
         self.cache = {}
         self.open_hand = self.hand.copy()
         self.seen = {}
-        self.eye_from_palm = np.linalg.inv(io.palm_from_wrist)
+        self.camera_roles = getattr(io, "camera_roles", ("head", "wrist"))
+        self.eye_from_palm = (
+            None if io.palm_from_wrist is None else np.linalg.inv(io.palm_from_wrist)
+        )
 
     def event(self, phase, **info):
         row = dict(
@@ -154,6 +168,7 @@ class Controller:
             name=self.name,
             attempt=self.attempt,
             phase=phase,
+            hand=self.side,
             **info,
         )
         self.events.append(row)
@@ -167,7 +182,7 @@ class Controller:
 
     def snapshot(self, role, tag):
         frame = self.io.camera(role)
-        prefix = f"{len(self.events):04d}_{self.name or 'survey'}_{self.attempt}_{tag}_{role}"
+        prefix = f"{self.side}_{len(self.events):04d}_{self.name or 'survey'}_{self.attempt}_{tag}_{role}"
         # Store raw samples from each decision exposure; RGB, depth and FK share a timestamp.
         np.savez_compressed(self.out / "observations" / (prefix + ".npz"), **frame)
         return frame
@@ -276,6 +291,8 @@ class Controller:
         return self.vertices_clear(pose, self.shape(hand), others)
 
     def vertices_clear(self, pose, local_vertices, others):
+        if not self.fixture_clear(pose):
+            return False
         vertices = local_vertices @ pose[:3, :3].T + pose[:3, 3]
         if vertices[:, 2].min() < self.table - 0.0015:
             return False
@@ -285,12 +302,31 @@ class Controller:
                 return False
         return True
 
+    def fixture_clear(self, pose):
+        return all(
+            (vertices @ pose[2, :3]).min() + pose[2, 3] >= self.table + 0.003
+            for vertices in getattr(self.io.model, "fixture_palm", {}).values()
+        )
+
     def command(self, joints, hand, duration):
         """Interpolate the planned joint path by arc length and keep the final hand target."""
         io = self.io
         start = self.hand.copy()
         hand = np.clip(hand, *io.model.limits["right"].T)
         joints = np.asarray(joints)
+        if (
+            self.table is not None
+            and getattr(io.model, "fixture_palm", {})
+            and not swept_clear(
+                joints, lambda arm, _: self.fixture_clear(self.ik.fk(arm))
+            )
+        ):
+            part = (
+                "tool flange"
+                if set(io.model.fixture_palm) == {"tool_flange"}
+                else "camera fixture"
+            )
+            raise NoPath(f"{part} would intersect the table")
         arc = np.r_[0.0, np.cumsum(np.max(np.abs(np.diff(joints, axis=0)), axis=1))]
         ticks = max(2, round(duration / io.dt))
         for i in range(1, ticks + 1):
@@ -540,7 +576,7 @@ class Controller:
     def lift_ik(self, palm, pre_joints):
         grasp = self.ik.solve(palm, pre_joints)
         probe = self.ik.solve(shifted(palm, [0, 0, 0.022]), grasp)
-        self.ik.solve(shifted(palm, [0, 0, self.lift_height + 0.009]), probe)
+        self.ik.solve(shifted(palm, [0, 0, self.lift_travel]), probe)
 
     def coarse_surface(self, name, observed):
         from .head_wrist_surface import RegisteredSurface
@@ -641,38 +677,94 @@ class Controller:
             d1 = cKDTree(target[::2]).query(cloud)[0]
             d2 = cKDTree(surface.world[::3]).query(cloud)[0]
             cloud = cloud[(d1 > 0.017) & (d2 > 0.020)]
+        if self.lightning is not None and hasattr(self.io, "bounds"):
+            parked = []
+            for link in self.io.bounds:
+                if link.startswith("left_") and link in self.io.model.hand_support:
+                    v = self.io.model.hand_support[link]
+                    t = self.io.fk(link)
+                    parked.append(v[:: max(1, len(v) // 60)] @ t[:3, :3].T + t[:3, 3])
+                elif link.endswith("_L") and link.startswith(("Link", "TCP_Link")):
+                    bounds = self.io.bounds[link]
+                    # Sample the six faces of the parked arm link's conservative box.
+                    unit = np.linspace(0.0, 1.0, 4)
+                    grid = np.array(np.meshgrid(unit, unit, unit)).reshape(3, -1).T
+                    grid = grid[np.any((grid == 0) | (grid == 1), axis=1)]
+                    t = self.io.fk(link)
+                    parked.append(
+                        (bounds[0] + grid * (bounds[1] - bounds[0])) @ t[:3, :3].T
+                        + t[:3, 3]
+                    )
+            if parked:
+                cloud = np.vstack([cloud, *parked])
         others = cKDTree(cloud)
+        if "wrist" not in self.camera_roles:
+            if not accurate:
+                raise NoPath("head mesh registration unconfirmed")
+            from .tabletop_vision import add_live_samples
+            from .tabletop_views import ViewBank
+
+            add_live_samples(surface, target, [])
+            if self.bank is None:
+                # Only robot FK and the joint-space roadmap are used in this mode.
+                self.bank = ViewBank(
+                    self.ik, np.eye(4), self.mid_arm, self.reference_arm
+                )
+            if self.lightning is not None:
+                family, seeds = "lightning", []
+            else:
+                family, seeds = (
+                    self.shared.query(surface, pose)
+                    if self.shared
+                    else (geometry_family(surface), self.library[name]["seeds"])
+                )
+            self.event(
+                "head_only_grasp", points=len(target), mesh_to_world=pose.tolist()
+            )
+            seed, poses = self.fit_registered(
+                name, family, surface, pose, seeds, choice["prior_postures"], others
+            )
+            return surface, pose, poses, seed, others
         # Keep the target itself in the observation obstacle set. It is removed
         # from the hand's contact-allowed set only after the pregrasp is reached.
         observations = cKDTree(np.vstack([cloud, target[::3], surface.world[::5]]))
         protected = surface if accurate else None
         point = (surface.world.max(0) + surface.world.min(0)) / 2
-        family, available = (
-            self.shared.query(surface, pose)
-            if self.shared
-            else (geometry_family(surface), self.library[name]["seeds"])
-        )
-        seeds = sorted(
-            available, key=lambda s: s["posture"] in choice["prior_postures"]
-        )
         views = []
         # For the shared library the head estimate only guides the approaching wrist.
         # The final arm/hand IK is computed after that exposure.
-        first = (
-            None
-            if self.shared and family not in ("handled", "slender")
-            else next(self.options(family, surface, pose, seeds[:5], others), None)
-        )
-        if self.shared and first is None and family not in ("handled", "slender"):
-            head_goal = pose @ np.array(seeds[0]["view"])
-            views.append((head_goal, np.array(seeds[0]["q_open"])))
-        if first is not None:
-            s, poses, _ = first
-            views.append((poses["view"], np.array(s["q_open"])))
+        if self.lightning is not None:
+            views.extend(self.lightning.head_views(self, name, pose, point))
+            hand = self.open_hand
+            self.event(
+                "lightning_head_pregrasp",
+                observed=accurate,
+                visible_candidates=len(views),
+            )
         else:
-            s = seeds[0]
-        # The camera can observe an item even when the preliminary hand approach is unreachable.
-        hand = np.minimum(np.array(s["q_open"]), np.full(22, 0.44))
+            family, available = (
+                self.shared.query(surface, pose)
+                if self.shared
+                else (geometry_family(surface), self.library[name]["seeds"])
+            )
+            seeds = sorted(
+                available, key=lambda s: s["posture"] in choice["prior_postures"]
+            )
+            first = (
+                None
+                if self.shared and family not in ("handled", "slender")
+                else next(self.options(family, surface, pose, seeds[:5], others), None)
+            )
+            if self.shared and first is None and family not in ("handled", "slender"):
+                head_goal = pose @ np.array(seeds[0]["view"])
+                views.append((head_goal, np.array(seeds[0]["q_open"])))
+            if first is not None:
+                s, poses, _ = first
+                views.append((poses["view"], np.array(s["q_open"])))
+            else:
+                s = seeds[0]
+            # The camera can observe an item even when the preliminary hand approach is unreachable.
+            hand = np.minimum(np.array(s["q_open"]), np.full(22, 0.44))
         # A reachable optical pose with an explicit arm solution often avoids a singularity.
         if self.bank is None:
             from .tabletop_views import ViewBank
@@ -688,6 +780,9 @@ class Controller:
             for distance in (0.22, 0.30, 0.15)
             for v in self.look_poses(point, distance)
         )
+        if self.lightning is not None and self.attempt > 1 and len(views) > 3:
+            offset = min(2 * (self.attempt - 1), len(views) - 1)
+            views = views[offset:] + views[:offset]
         examined = 0
         for v, h in views:
             if self.visible(v, surface.world[::9]) < 0.29 or not self.clear(
@@ -727,24 +822,29 @@ class Controller:
                 from .tabletop_vision import add_live_samples
 
                 add_live_samples(refined, target, near)
-                family, available = (
-                    self.shared.query(refined, reg)
-                    if self.shared
-                    else (geometry_family(refined), self.library[name]["seeds"])
-                )
-                seeds = sorted(
-                    available, key=lambda s: s["posture"] in choice["prior_postures"]
-                )
-                self.event(
-                    "mesh_contact_family",
-                    family=family,
-                    types_considered=(36 if self.shared else len(seeds)),
-                    shared_catalog=bool(self.shared),
-                )
+                if self.lightning is not None:
+                    family, seeds = "lightning", []
+                else:
+                    family, available = (
+                        self.shared.query(refined, reg)
+                        if self.shared
+                        else (geometry_family(refined), self.library[name]["seeds"])
+                    )
+                    seeds = sorted(
+                        available,
+                        key=lambda s: s["posture"] in choice["prior_postures"],
+                    )
+                    self.event(
+                        "mesh_contact_family",
+                        family=family,
+                        types_considered=(36 if self.shared else len(seeds)),
+                        shared_catalog=bool(self.shared),
+                    )
                 self.event(
                     "registered_wrist",
                     points=len(near),
                     median_m=details["median_residual_m"],
+                    mesh_to_world=reg.tolist(),
                     center=details["center"],
                 )
                 s, poses = self.fit_registered(
@@ -760,6 +860,10 @@ class Controller:
         )
 
     def fit_registered(self, name, family, refined, reg, seeds, prior_postures, others):
+        if self.lightning is not None:
+            return self.lightning.select(
+                self, name, refined, reg, others, prior_postures
+            )
         best = None
         # After a failed contact or when a transferred hand shape is unreachable,
         # refit the catalog's thumb/finger pads to the new measured contact band.
@@ -828,18 +932,46 @@ class Controller:
         self.event("selected", posture=s["posture"], yaw_deg=angle, origin=s["origin"])
         return s, poses
 
+    def reacquire_head(self, reference):
+        """Match a fresh D455 component near a recently released or occluded target."""
+        if reference is None:
+            return None
+        candidates = []
+        for p in self.head_pieces:
+            delta = np.linalg.norm(p["center"][:2] - reference["center"][:2])
+            color = np.linalg.norm(p["color"][:3] - reference["color"][:3])
+            size = np.linalg.norm(
+                np.log(
+                    np.maximum(p["dims"], 0.001) / np.maximum(reference["dims"], 0.001)
+                )
+            )
+            if delta < 0.067 and color < 0.38 and size < 1.15:
+                candidates.append((delta / 0.055 + color + 0.25 * size, p))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0])
+        if len(candidates) > 1 and candidates[1][0] - candidates[0][0] < 0.16:
+            return None
+        score, p = candidates[0]
+        self.event(
+            "reacquired_head_roi",
+            points=len(p["xyz"]),
+            offset_m=float(np.linalg.norm(p["center"][:2] - reference["center"][:2])),
+        )
+        return dict(p, match_cost=score)
+
     def begin_lift(self, surface):
         from .tabletop_tracking import initialize
 
         self.tracks = {
             role: initialize(self.snapshot(role, "before_lift"), self.io, surface.world)
-            for role in ("head", "wrist")
+            for role in self.camera_roles
         }
 
     def vote(self, surface, pose, palm0, color, tag):
         held = self.io.fk(PALM) @ np.linalg.inv(palm0) @ pose
         votes = {}
-        for role in ("head", "wrist"):
+        for role in self.camera_roles:
             frame = self.snapshot(role, tag)
             votes[role] = match_height(
                 frame, self.io, self.table, surface.local, pose, held, color
@@ -894,8 +1026,7 @@ class Controller:
             ):
                 vote = "on_table"
             elif not tag.startswith("test_observation") and any(
-                min(v["tracked_bottom_rise_m"], v["tracked_rise_m"])
-                < self.lift_height
+                min(v["tracked_bottom_rise_m"], v["tracked_rise_m"]) < self.lift_height
                 for v in tracks
             ):
                 vote = "unknown"
@@ -921,6 +1052,23 @@ class Controller:
             raise NoPath("wrist refinement invalidated clearance")
         self.event("approach", posture=seed["posture"])
         self.move(pre, qo, 0.58, others, True, surface, object_margin=0.0005)
+        if seed["origin"] == "lightning_grasp":
+            try:
+                seated = self.ik.solve(shifted(grasp, -0.009 * grasp[:3, 0]), self.arm)
+                self.lift_ik(grasp, seated)
+            except NoPath:
+                delta = pre[:3, 3] - grasp[:3, 3]
+                delta = 0.035 * delta / max(np.linalg.norm(delta), 1e-6)
+                try:
+                    self.move(
+                        shifted(self.io.fk(PALM), delta + [0, 0, 0.012]),
+                        qo,
+                        0.35,
+                        others,
+                    )
+                except NoPath:
+                    pass
+                raise NoPath("executed pregrasp has insufficient lift reach")
         first = self.io.fk(PALM)
         close_started = False
         try:
@@ -931,7 +1079,14 @@ class Controller:
             )
             close_started = True
             sites = []
-            if seed["origin"] == "wrist_handle_cross_sections":
+            if seed["origin"] == "lightning_grasp":
+                # Seat the open hand before applying the native joint solution.
+                seat = shifted(grasp, -0.009 * grasp[:3, 0])
+                self.closing(seat, qo, 0.48)
+                self.closing(grasp, qt, 0.65)
+                self.closing(grasp, qc, 0.42)
+                self.hold(0.20)
+            elif seed["origin"] == "wrist_handle_cross_sections":
                 from .tabletop_handle import seat, surround_handle
 
                 surround_handle(self, surface, grasp, qt)
@@ -992,7 +1147,7 @@ class Controller:
                 )
             if verdict != "carried":
                 return verdict
-            self.move(shifted(palm0, [0, 0, self.lift_height + 0.009]), self.hand, 0.65)
+            self.move(shifted(palm0, [0, 0, self.lift_travel]), self.hand, 0.65)
             if not self.template_comparison:
                 # A compliant object can tilt or slip a little even as it follows the hand.
                 # Use the observed motion of its bottom before starting the hold clock.
@@ -1072,8 +1227,8 @@ class Controller:
         target = self.ik.solve(goal, start)
         self.command([start, target], hand, seconds)
 
-    def execute(self, targets=None):
-        (self.out / "observations").mkdir()
+    def execute(self, targets=None, finish=True):
+        (self.out / "observations").mkdir(exist_ok=True)
         self.survey()
         anchors = {name: dict(obs) for name, obs in self.seen.items()}
         pending = list(self.library if targets is None else dict.fromkeys(targets))
@@ -1093,7 +1248,8 @@ class Controller:
                     anchors[name] = head[name]
                     continue
                 # Use the last observed location to direct a fresh wrist exposure during occlusion.
-                feedback[name] = ref
+                if "wrist" in self.camera_roles:
+                    feedback[name] = ref
             for name, item in head.items():
                 if name not in anchors:
                     anchors[name] = item
@@ -1110,13 +1266,16 @@ class Controller:
             self.name = min(pending, key=priority)
             pending.remove(self.name)
             self.attempt = 0
-            result = {"prior_postures": [], "outcomes": []}
+            result = {"hand": self.side, "prior_postures": [], "outcomes": []}
             self.results[self.name] = result
-            for index in range(1, 3):
+            attempts = 3 if self.lightning is not None else 2
+            for index in range(1, attempts + 1):
                 self.attempt = index
                 self.event("attempt_start")
                 observed = feedback.get(self.name)
-                if observed is None or observed["match_cost"] > 1.65:
+                if "wrist" in self.camera_roles and (
+                    observed is None or observed["match_cost"] > 1.65
+                ):
                     self.event("wrist_search")
                     # Registered table survey positions are independent of the randomized object poses.
                     for xy in ((0.80, -0.26), (0.76, 0.04)):
@@ -1145,23 +1304,40 @@ class Controller:
                         reason = str(error)
                 result["outcomes"].append(reason)
                 self.event("attempt_end", reason=reason)
-                save(self.out / "decisions.json", self.results)
+                file = self.out / "decisions.json"
+                previous = json.loads(file.read_bytes()) if file.exists() else {}
+                save(file, dict(previous, **self.results))
                 if reason == "vision_pass" or (
-                    index == 1 and not result["prior_postures"]
+                    index == 1
+                    and not result["prior_postures"]
+                    and self.lightning is None
                 ):
                     break
-                if index < 2:
+                if self.lightning is not None and (
+                    reason.startswith("no Lightning Grasp bank")
+                    or "zero collision-filtered" in reason
+                    or (index >= 2 and not result["prior_postures"])
+                ):
+                    break
+                if index < attempts:
                     fresh = self.survey()
-                    if (
-                        self.name in fresh
-                        and np.linalg.norm(
+                    if "wrist" not in self.camera_roles:
+                        previous = feedback.pop(self.name, None)
+                        local = self.reacquire_head(previous)
+                        if local is not None:
+                            feedback[self.name] = local
+                    if self.name in fresh and (
+                        observed is None
+                        or np.linalg.norm(
                             fresh[self.name]["center"][:2] - observed["center"][:2]
                         )
                         < 0.055
                     ):
                         feedback[self.name] = fresh[self.name]
             self.event("target_end", reason=result["outcomes"][-1])
-        self.event("episode_end")
+        if finish:
+            self.event("episode_end")
+        return self.results
 
 
 def run(

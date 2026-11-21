@@ -30,7 +30,7 @@ def volume_center(parts):
 
 
 def plan(controller, surface, used, others, cards):
-    from .tabletop_meshfit import gravity_residual
+    from .tabletop_meshfit import gravity_residual, thumb_height
 
     surface = copy(surface)
     surface.world = getattr(surface, "handle_world", surface.world)
@@ -78,8 +78,10 @@ def plan(controller, surface, used, others, cards):
             ]
             wrench = gravity_residual(sites, center)
             quality = lever + 0.035 * wrench + 0.45 * (gaps[0] + np.mean(gaps[1:]))
-            pool.append((quality, lever, wrench, name, g))
-    for _, lever, wrench, name, g in sorted(pool, key=lambda row: row[0]):
+            dz = thumb_height(sites)
+            quality += 2.0 * max(0.0, -0.002 - dz) + 0.20 * max(gaps[1:])
+            pool.append((quality, lever, wrench, dz, name, g))
+    for _, lever, wrench, dz, name, g in sorted(pool, key=lambda row: row[0]):
         for initial in (
             controller.arm,
             controller.mid_arm,
@@ -106,6 +108,7 @@ def plan(controller, surface, used, others, cards):
                 q_open=g.opened.tolist(),
                 q_target=g.closed.tolist(),
                 uniform_density_center_m=center.tolist(),
+                thumb_height_m=round(dz, 5),
                 axial_balance_error_m=round(float(lever), 5),
                 wrench_residual=round(float(wrench), 5),
                 **{
@@ -121,7 +124,7 @@ def plan(controller, surface, used, others, cards):
 def reobserve(controller, surface, pose, tag="handle_seated"):
     samples = []
     live = {}
-    for role in ("head", "wrist"):
+    for role in getattr(controller, "camera_roles", ("head", "wrist")):
         fr = controller.snapshot(role, tag)
         cloud = wrist_points(fr, controller.io, surface, controller.table, 0.022)
         if len(cloud) >= 30:

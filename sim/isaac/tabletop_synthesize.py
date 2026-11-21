@@ -22,7 +22,7 @@ from .tabletop_meshfit import carry_shape, closure_path
 from .tabletop_vision import add_live_samples
 
 
-def station_kinematics(source):
+def station_kinematics(source, wrist_mount="removed"):
     from pxr import Usd, UsdGeom
 
     root = asset_path(source, "source")
@@ -44,7 +44,18 @@ def station_kinematics(source):
         if name.startswith("right_") and collision_bounds(stage, path, box) is not None:
             support[name] = collision_support(stage, path)
     limits = tree.joint_limits(RIGHT_JOINTS)
+    from .scene_wrist_mount import palm_parts, resolve_mount
+
+    palm_from_tcp = np.linalg.solve(
+        tree.pose("right_hand_C_MC", initial), tree.pose("TCP_Link_R", initial)
+    )
+    mount_path = resolve_mount(wrist_mount)
+    fixture = palm_parts(mount_path, palm_from_tcp)
+    if mount_path is None:
+        tcp = collision_support(stage, "/World/Robot/TCP_Link_R")
+        fixture["tool_flange"] = tcp @ palm_from_tcp[:3, :3].T + palm_from_tcp[:3, 3]
     model = SimpleNamespace(
+        fixture_palm=fixture,
         robot=SimpleNamespace(joint_names=names),
         tree=tree,
         hand_names={"right": RIGHT_JOINTS},

@@ -34,6 +34,22 @@ class RegisteredSurface:
         self.parts = [v for v, _ in bundle["collisions"]]
         self.support = np.vstack(self.parts)
         self.fit = None
+        self.detail_points = self.detail_normals = None
+        if sample_faces:
+            valid = area > 1e-12
+            tri = triangles[valid]
+            normal = np.cross(tri[:, 1]-tri[:, 0], tri[:, 2]-tri[:, 0])
+            normal /= np.linalg.norm(normal, axis=1, keepdims=True)
+            # Equal-area sampling preserves the original visual surface, independent
+            # of tessellation density and of the convex bodies used by dynamics.
+            weights = area[valid]
+            count = int(np.clip(weights.sum() / 0.000003, 1800, 18000))
+            rng = np.random.default_rng(17)
+            ids = rng.choice(len(tri), count, p=weights/weights.sum())
+            u, v = rng.random((2, count))
+            u = np.sqrt(u)
+            self.detail_points = (1-u[:, None])*tri[ids, 0] + (u*(1-v))[:, None]*tri[ids, 1] + (u*v)[:, None]*tri[ids, 2]
+            self.detail_normals = normal[ids]
 
     def register(self, observed, table):
         points = observed[:: max(1, len(observed) // 680)]
@@ -98,6 +114,9 @@ class RegisteredSurface:
     def place(self, rot, shift, table):
         """Express this metric prior and its convex supports in a known table frame."""
         self.world = self.local @ rot.T + shift
+        if self.detail_points is not None:
+            self.detail_world = self.detail_points @ rot.T + shift
+            self.detail_world_normals = self.detail_normals @ rot.T
         self.world_parts = [p @ rot.T + shift for p in self.parts]
         # Slab directions for conservative whole-object approach checks, including distinct colliders.
         angle = np.linspace(0, 2 * np.pi, 24, endpoint=False)

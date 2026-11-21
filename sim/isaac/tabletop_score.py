@@ -48,7 +48,9 @@ def evaluate(scene, directory, lift_height=None):
     lower = []
     for i, name in enumerate(recording["object_names"].tolist()):
         obj = by_name[name]
-        names.append(Path(obj["mesh"]["file"]).stem)
+        stem = Path(obj["mesh"]["file"]).stem
+        aliases = scene.get("evaluation_aliases", {})
+        names.append(aliases.get(stem, stem))
         pieces = load_mesh_bundle(obj["mesh"])["collisions"]
         lower.append(
             path_minimum(root[:, i], np.concatenate([v for v, _ in pieces])) - table
@@ -62,6 +64,25 @@ def evaluate(scene, directory, lift_height=None):
     for name, decision in decisions.items():
         physical_name = scene.get("evaluation_aliases", {}).get(name, name)
         target = names.index(physical_name)
+        side = decision.get("hand", "right")
+
+        def channel(key):
+            name = side + "_" + key
+            return recording[name] if name in recording.files else recording[key]
+
+        palm, forces = channel("palm_wxyz"), channel("hand_load_N")
+        fixture_key = side + "_fixture_tcp_vertices"
+        fixture_min = (
+            path_minimum(recording[side + "_tcp_wxyz"], recording[fixture_key]) - table
+            if fixture_key in recording.files
+            else None
+        )
+        flange_key = side + "_flange_tcp_vertices"
+        flange_min = (
+            path_minimum(recording[side + "_tcp_wxyz"], recording[flange_key]) - table
+            if flange_key in recording.files
+            else None
+        )
         tries = []
         for index, why in enumerate(decision["outcomes"], 1):
             ev = [e for e in events if e["name"] == name and e["attempt"] == index]
@@ -77,16 +98,40 @@ def evaluate(scene, directory, lift_height=None):
             executed = close_time is not None and release_time - close_time >= 0.70
             row = {
                 "attempt": index,
+                "hand": side,
                 "online": why,
                 "closure": executed,
                 "closure_requested": close_time is not None,
                 "wrist_refined": "registered_wrist" in phases,
+                "head_only_grasp": "head_only_grasp" in phases,
                 "stable": False,
                 "raised": False,
                 "held_through_end": False,
                 "start_s": round((first + 1) * dt, 3),
                 "end_s": round((last + 1) * dt, 3),
             }
+            if flange_min is not None:
+                row["minimum_tool_flange_clearance_m"] = round(
+                    float(flange_min[first : last + 1].min()), 5
+                )
+            if fixture_min is not None:
+                row["minimum_fixture_table_clearance_m"] = round(
+                    float(fixture_min[first : last + 1].min()), 5
+                )
+            if (
+                "selected" in phases
+                and phases["selected"].get("origin") == "lightning_grasp"
+            ):
+                row["predicted_contact_links"] = phases["selected"].get(
+                    "physical_contact_links",
+                    [
+                        link.replace("right_", side + "_")
+                        for link in phases["selected"]["native_contact_links"]
+                    ],
+                )
+                row["predicted_thumb_height_difference_m"] = phases["selected"][
+                    "thumb_above_mean_fingers_m"
+                ]
             travel = np.linalg.norm(
                 root[first : last + 1, :, :3] - root[first, :, :3], axis=2
             ).max(axis=0)
@@ -110,6 +155,37 @@ def evaluate(scene, directory, lift_height=None):
                 if "hold_start" in phases and "hold_end" in phases:
                     u = tick(phases["hold_start"]["time"]) - a
                     v = tick(phases["hold_end"]["time"]) - a
+                    if "digit_load_N" in recording.files:
+                        digits = channel("digit_load_N")[a + u : a + v + 1, :, target]
+                        row["four_fingers_loaded_hold_fraction"] = round(
+                            float(np.mean((digits[:, 1:] > 0.25).all(1))), 4
+                        )
+                        row["thumb_loaded_hold_fraction"] = round(
+                            float(np.mean(digits[:, 0] > 0.25)), 4
+                        )
+                        row["hold_digit_mean_N"] = dict(
+                            zip(
+                                recording["digit_names"].tolist(),
+                                np.round(digits.mean(0).astype(float), 3),
+                            )
+                        )
+                    pad_key = side + "_pad_center_z_m"
+                    if pad_key in recording.files:
+                        heights = recording[pad_key][a + u : a + v + 1]
+                        diff = heights[:, 0] - heights[:, 1:].mean(1)
+                        row["actual_thumb_above_four_median_m"] = round(
+                            float(np.median(diff)), 5
+                        )
+                    link_key = side + "_link_load_N"
+                    if link_key in recording.files:
+                        names_by_link = recording[side + "_link_names"].tolist()
+                        if side + "_hand_C_MC" in names_by_link:
+                            palm_load = recording[link_key][
+                                a + u : a + v + 1,
+                                names_by_link.index(side + "_hand_C_MC"),
+                                target,
+                            ]
+                            row["palm_mean_hold_N"] = round(float(palm_load.mean()), 3)
                     row.update(
                         hold_phase_s=round(float((v - u) * dt), 4),
                         hold_phase_minimum_rise_m=round(
@@ -177,7 +253,7 @@ def evaluate(scene, directory, lift_height=None):
                         )
                         if dp <= 0.03 and dr <= 0.5:
                             if "digit_load_N" in recording.files:
-                                window_loads = recording["digit_load_N"][
+                                window_loads = channel("digit_load_N")[
                                     a + start : a + stop, :, target
                                 ]
                                 digits = recording["digit_names"].tolist()

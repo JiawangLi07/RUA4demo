@@ -125,11 +125,17 @@ if __name__ == "__main__":
     parser.add_argument("--base", type=Path, required=True)
     parser.add_argument("--objects", type=Path, required=True)
     parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument(
+        "--aliases", type=Path, help="registry key to display name for offline scoring"
+    )
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
+    objects = json.loads(args.objects.read_bytes())
     config = make_scene(
         json.loads(args.base.read_bytes()),
-        json.loads(args.objects.read_bytes()),
+        list(objects.values()) if isinstance(objects, dict) else objects,
         args.seed,
     )
+    if args.aliases:
+        config["evaluation_aliases"] = json.loads(args.aliases.read_bytes())
     args.out.write_text(json.dumps(config, indent=2) + "\n")

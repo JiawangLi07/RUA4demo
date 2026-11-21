@@ -115,11 +115,17 @@ def proposals(frame, io, table=None):
 
 
 class Models:
-    def __init__(self, library):
+    def __init__(self, library, mirror=False):
         self.library = library
         self.bundles = {
             name: load_mesh_bundle(row["prior"]) for name, row in library.items()
         }
+        if mirror:
+            from .tabletop_sides import reflected_bundle
+
+            self.bundles = {
+                name: reflected_bundle(b) for name, b in self.bundles.items()
+            }
         self.features = {}
         for name, bundle in self.bundles.items():
             v, _, colors = bundle["visual"]

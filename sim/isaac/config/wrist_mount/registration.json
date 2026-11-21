@@ -1,0 +1,34 @@
+{
+  "input_sha256": "de5da17f602875b23551c1285891c01355025e33b8ffd9d4a3de0a845076753f",
+  "unit": "mm",
+  "right_tcp_from_cad_m": [
+    [
+      0.9999996260952937,
+      0.0008123520723549305,
+      0.0002964681827562033,
+      -0.7250430227881871
+    ],
+    [
+      0.0008122605882864727,
+      -0.9999996225086444,
+      0.0003085697756176565,
+      -0.0005653464728708341
+    ],
+    [
+      0.00029671873813849636,
+      -0.00030832885082137344,
+      -0.9999999084456512,
+      -0.03136892571554609
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "bracket_guid": "3fbfe022-592e-4351-99a6-0a7bc4ccfa62",
+  "housing_guid": "4bd42651-7ef3-4eb0-bf90-ab2f8580f2df",
+  "source": "002.3dm, right flange surface registration and station installation clocking. The left bracket is mirrored in TCP coordinates.",
+  "registration_p95_mm": 0.27509689446327834
+}

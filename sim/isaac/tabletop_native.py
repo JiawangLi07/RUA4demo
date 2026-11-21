@@ -16,6 +16,21 @@ def main():
     parser.add_argument("--library", type=Path)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--observe-only", action="store_true")
+    parser.add_argument("--camera-mode", choices=("head", "head-wrist"), default="head")
+    parser.add_argument(
+        "--wrist-hardware",
+        choices=("removed", "mounted"),
+        help="defaults to removed for head-only operation, mounted for head-wrist",
+    )
+    parser.add_argument("--hands", choices=("right", "left", "both"), default="right")
+    parser.add_argument(
+        "--lightning-candidates",
+        type=Path,
+        help="directory of native Sharpa Lightning Grasp banks",
+    )
+    parser.add_argument(
+        "--wrist-mount", type=Path, help="registered 002.3dm fixture bundle"
+    )
     parser.add_argument(
         "--lift-height-m",
         type=float,
@@ -34,6 +49,15 @@ def main():
     )
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
+    hardware = args.wrist_hardware or (
+        "removed" if args.camera_mode == "head" else "mounted"
+    )
+    if hardware == "removed" and (
+        args.camera_mode != "head" or args.wrist_mount is not None
+    ):
+        parser.error(
+            "removed wrist hardware requires head camera mode and no wrist fixture path"
+        )
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     args.enable_cameras = True
@@ -47,10 +71,15 @@ def main():
         from .scene_isaac import NativeBimanualScene
         from .tabletop_io import connect
 
-        scene = NativeBimanualScene(
-            json.loads(args.scene.read_bytes()), out, args.device
-        )
-        io, audit = connect(scene, out)
+        config = json.loads(args.scene.read_bytes())
+        config["active_hands"] = args.hands
+        config["camera_mode"] = args.camera_mode
+        config["wrist_hardware"] = hardware
+        if args.wrist_mount:
+            config["wrist_mount"] = str(args.wrist_mount.resolve())
+        scene = NativeBimanualScene(config, out, args.device)
+        sides = ["right", "left"] if args.hands == "both" else [args.hands]
+        io, audit = connect(scene, out, sides[0])
         home = io.commanded_joints()
         for _ in range(round(1.5 / io.dt)):
             io.step(home[io.arm], home[io.hand])
@@ -61,31 +90,90 @@ def main():
         try:
             if not args.observe_only:
                 from .tabletop_catalog import load_registry
-                from .tabletop_control import run
+                from .tabletop_control import Controller
+                from .tabletop_lightning import LightningBank
 
                 if args.library is None:
                     parser.error("--library is required for a grasp trial")
-                spec, shared = load_registry(args.library, args.template_comparison)
+                spec, shared = load_registry(
+                    args.library,
+                    args.template_comparison,
+                    load_postures=args.lightning_candidates is None,
+                )
                 (out / "trial_settings.json").write_text(
                     json.dumps(
                         {
                             "lift_height_m": args.lift_height_m,
                             "grasp_inputs": "rgbd_mesh_commanded_kinematics",
                             "joint_observation": "issued_targets",
+                            "hands": sides,
+                            "camera_mode": args.camera_mode,
+                            "wrist_hardware": hardware,
+                            "solver": "lightning_grasp"
+                            if args.lightning_candidates
+                            else "mesh_fit",
+                            "mount_installed": scene.fixture_path is not None,
                         }
                     )
                 )
-                run(
-                    io,
-                    spec,
-                    out,
-                    args.target,
-                    args.template_comparison,
-                    shared,
-                    args.lift_height_m,
-                )
+                controllers = []
+                for i, side in enumerate(sides):
+                    device = io if i == 0 else connect(scene, out, side, audit)[0]
+                    bank = (
+                        LightningBank(args.lightning_candidates, side)
+                        if args.lightning_candidates
+                        else None
+                    )
+                    controllers.append(
+                        Controller(
+                            device,
+                            spec,
+                            out,
+                            args.template_comparison,
+                            shared,
+                            args.lift_height_m,
+                            bank,
+                        )
+                    )
+                targets = list(args.target or spec)
+                if len(controllers) == 1:
+                    controllers[0].execute(targets)
+                else:
+                    (out / "observations").mkdir(exist_ok=True)
+                    seen = controllers[0].survey()
+                    # Assign from the two initial palm poses and segmented head depth.
+                    # No simulator identities or world object transforms enter this choice.
+                    palms = [io.fk(side + "_hand_C_MC")[:2, 3] for side in sides]
+                    groups = [[], []]
+                    for name in targets:
+                        group = (
+                            0
+                            if name not in seen
+                            else int(
+                                np.argmin(
+                                    [
+                                        np.linalg.norm(seen[name]["center"][:2] - palm)
+                                        for palm in palms
+                                    ]
+                                )
+                            )
+                        )
+                        groups[group].append(name)
+                    for i, ctrl in enumerate(controllers):
+                        ctrl.event("hand_assignment", targets=groups[i])
+                        ctrl.execute(groups[i], finish=i == 1)
+                        if i == 0 and groups[i]:
+                            ctrl.leave_low_pose()
         finally:
             audit.save()
+            (out / "sensor_usage.json").write_text(
+                json.dumps(
+                    {
+                        "controller_reads": scene.sensor_calls,
+                        "active_wrist_devices": list(scene.wrist_devices),
+                    }
+                )
+            )
             (out / "frames.json").write_text(json.dumps(scene.frame_times))
         (out / "complete.json").write_text(
             json.dumps({"frames": scene.frame_number, "sim_seconds": scene.time})

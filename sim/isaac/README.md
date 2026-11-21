@@ -162,3 +162,27 @@ python -m sim.isaac.tabletop_video --scene table41.json --run runs/table41 --spe
 在原始散摆回放包上，将 `RUA_SIM_ASSETS` 指向解包后的目录，并向原生入口传入 `scene41.json` 或 `scene73.json` 以及 `--library anon14.json`。四个独立构造的网格使用 `scene317.json` 或 `scene318.json` 以及 `anon4.json`。单件螺丝刀使用 `scene1001.json --library anon14.json --target part_763ed53f`。清单中的匿名标识关联几何。场景中的 `evaluation_aliases` 仅供离线评分与视频字幕使用。历史单件参考清单 `library.json` 另存以复现早期对照。原生入口输出目录应是新目录。视频工具可读取回合内双路 PNG，或对应的 `head.mp4`、`observer.mp4`。
 
 `observations/` 保存决策时的 RGB、深度、相机标定与已发出的关节指令。每帧 `joint_source=command`。`events.jsonl` 记录求得的掌位、指角、接触区、各阶段和失败原因。`physics_audit.npz` 保存独立评分用的逐步真值。随机桌面的默认目标为 5 cm。持稳要求指定物体的本体抬升与最低点离桌同时达到目标高度、连续 2 s，期间至少 90% 的时间有手部载荷（超过 0.05 N），相对掌位平移漂移不超过 3 cm，旋转漂移不超过 0.5 rad。仿真使用理想 RGB-D，桌上所有物体在重试和切换间保持物理状态。视觉判定可与离线评分逐项对照。评分分别给出是否到达高度、是否存在连续持稳的 2 秒，以及指令保持结束前的最后 2 秒是否仍满足全部条件。新版独立记录器还保留逐手部刚体的目标载荷，可单独核查掌面与近节实际承力。执行与评分均支持 `--lift-height-m`。历史回合保留原判据，另评 5 cm 时可加 `--lift-height-m 0.05 --out score_5cm.json`。
+
+## Head-only Lightning Grasp with fused metric scans
+
+The tabletop entry point defaults to the head D455 with both wrist cameras, housings and camera brackets removed. The native hand flanges and their colliders stay attached. The outside camera records video. Only the D455 feeds the controller. The optional mounted configuration can reproduce earlier experiments with `--camera-mode head-wrist --wrist-hardware mounted --wrist-mount <bundle.npz>`.
+
+The fused GLBs are object-local in metres with table Y up. The converter checks their bounds and topology against the capture evaluation, rotates them to station Z up and records the transform. Full-resolution triangles supply the Lightning Grasp surface. A lighter visual mesh and convex parts supply the simulator. Mass and friction are simulation assumptions. The capture report distinguishes the views used to build these stored models from the cameras used at runtime.
+
+```bash
+python -m sim.isaac.tabletop_fused_assets --input "$FUSED_MODELS" --out "$FUSED" --mass-reference "$REFERENCE_SCENE"
+python -m sim.isaac.tabletop_lightning_assets --station real2sim_0417 --out "$HAND"
+python -m sim.isaac.tabletop_lightning_generate --upstream "$LIGHTNING_GRASP" --hand "$HAND/sharpa.urdf" --meshes "$FUSED"/dense/*.ply --out "$BANK" --tabletop --contacts 5 4 3
+```
+
+Install the CUDA extension and dependencies specified by the [upstream Lightning Grasp release](https://github.com/zhaohengyin/lightning-grasp). The hand exporter reads the station URDF, collider surfaces and its self-collision exclusions. The upstream contact-field, force-closure search, IK and collision filter return the grasp transform and 22 joint angles. `--power-contact` also samples the inner middle phalanges. Separate banks can be combined with `python -m sim.isaac.tabletop_lightning_banks --directories "$BANK" "$POWER_BANK" --out "$COMBINED"`. Each result retains its generating bank and original row.
+
+Place the generated `fused_metric` directory alongside `real2sim_0417` under `RUA_SIM_ASSETS`. The following commands build a scattered layout from the hash-pinned objects and execute it.
+
+```bash
+python -m sim.isaac.tabletop_layout --base "$REFERENCE_SCENE" --objects "$FUSED/objects.json" --aliases "$FUSED/aliases.json" --seed 3141 --out "$SCENE"
+"$ISAAC_PYTHON" -m sim.isaac.tabletop_native --scene "$SCENE" --library "$FUSED/registry.json" --hands both --camera-mode head --wrist-hardware removed --lightning-candidates "$BANK" --lift-height-m 0.05 --headless --out "$RUN"
+python -m sim.isaac.tabletop_score --scene "$SCENE" --run "$RUN"
+```
+
+The head depth registers the object, then the planner places the native palm pose, checks the table, opposite arm and arm IK, opens for approach, and continuously closes onto the selected finger configuration. The test lift and hold use head RGB-D and issued joint commands. Both the native object rise and its lowest point above the table must reach the goal during the independent two-second physics check. The output includes per-digit and palm loads, actual pad heights, wrist-device read counts, and the list of active wrist-assembly colliders. The geometry registry supplies the known metric object models.

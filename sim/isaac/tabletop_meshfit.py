@@ -74,6 +74,13 @@ class ContactSurface:
         from scipy.spatial import cKDTree
 
         template = cKDTree(refxyz)
+        if hasattr(surface, "detail_world"):
+            dense = surface.detail_world
+            normals = surface.detail_world_normals.copy()
+            normals[np.sum(normals * refn[template.query(dense)[1]], axis=1) < 0] *= -1
+            self.pts = np.vstack([self.pts, dense])
+            self.normals = np.vstack([self.normals, normals])
+            self.source = np.r_[self.source, np.full(len(dense), "visual_mesh")]
         for label, cloud in getattr(surface, "camera_samples", {}).items():
             if len(cloud) < 8:
                 continue
@@ -96,13 +103,17 @@ class ContactSurface:
         self.height = np.ptp(surface.world[:, 2])
         self.table = surface.table
 
-    def assign(self, point, direction, avoid_bottom=True):
+    def assign(self, point, direction, avoid_bottom=True, side_wall=False):
         distance = np.linalg.norm(self.pts - point, axis=1)
         cosine = self.normals @ direction
         cost = distance + 0.028 * (1 - cosine)
-        cost += 0.0030 * (self.source == "registered_prior") + 0.001 * (
-            self.source == "head_depth"
+        cost += (
+            0.0070 * (self.source == "registered_prior")
+            + 0.001 * (self.source == "head_depth")
+            + 0.0015 * (self.source == "visual_mesh")
         )
+        if side_wall:
+            cost += 0.045 * np.maximum(np.abs(self.normals[:, 2]) - 0.13, 0)
         cost += 0.09 * np.maximum(0.16 - cosine, 0)
         if avoid_bottom:
             cost += 0.05 * (self.pts[:, 2] < self.table + 0.0025) + 0.035 * (
@@ -207,7 +218,9 @@ class HandContacts:
                     np.quantile(projection, 0.96) - (target - surf.center) @ side
                 )
                 d = unit(0.18 * d + 0.86 * side - np.array([0, 0, 0.10]))
-            c["goal"], c["normal"], c["source"] = surf.assign(target, d)
+            c["goal"], c["normal"], c["source"] = surf.assign(
+                target, d, side_wall=PALM in roles
+            )
             c["weight"] = (
                 1.45
                 if link == PALM or "thumb" in link
@@ -234,6 +247,8 @@ def roles_for(family, card, hand):
     wrap = family == "wrap"
     wanted = card.get("intended_contacts", [])
     digits = [d for d in FINGERS if any(f"_{d}_" in n for n in wanted)]
+    if wrap:
+        digits = list(FINGERS)
     if not digits:
         digits = ["thumb", "index", "middle"] if not wrap else list(FINGERS)
     if "thumb" not in digits:
@@ -247,12 +262,22 @@ def roles_for(family, card, hand):
         links.extend(
             [
                 PALM,
-                *["right_" + d + "_PP" for d in ("index", "middle", "ring")],
-                "right_middle_MP",
-                "right_ring_MP",
+                *[
+                    "right_" + d + "_" + segment
+                    for d in FINGERS[1:]
+                    for segment in ("PP", "MP")
+                ],
             ]
         )
     return [link for link in dict.fromkeys(links) if link in hand.chains]
+
+
+def thumb_height(contacts):
+    """Positive if the thumb contact is above the median opposing pad, in metres."""
+    pads = [c for c in contacts if c["link"].endswith("_elastomer")]
+    thumb = next(c for c in pads if "_thumb_" in c["link"])
+    other = [c["goal"][2] for c in pads if "_thumb_" not in c["link"]]
+    return float(thumb["goal"][2] - np.median(other))
 
 
 def open_around_surface(hand, contacts, palm, initial, lo, hi):
@@ -298,7 +323,12 @@ def refine(controller, family, surface, candidates, others):
                 rows.extend((w * j, w * 0.007 * jn))
                 errors.extend(
                     (
-                        w * (c["goal"] - 0.002 * c["normal"] - pt),
+                        w
+                        * (
+                            c["goal"]
+                            - (0.004 if c["link"] == PALM else 0.002) * c["normal"]
+                            - pt
+                        ),
                         w * 0.007 * (-c["normal"] - n),
                     )
                 )
@@ -352,11 +382,19 @@ def refine(controller, family, surface, candidates, others):
         wrap = PALM in gaps
         quality = (
             1.4 * thumb
-            + np.mean(opponents[:2])
+            + (
+                np.mean(opponents) + 1.2 * opponents[-1]
+                if wrap
+                else np.mean(opponents[:2])
+            )
             + np.mean(list(gaps.values()))
             + 0.8 * gaps.get(PALM, 0)
         )
-        if thumb > 0.024 or opponents[0] > 0.024 or (wrap and gaps[PALM] > 0.031):
+        if (
+            thumb > 0.024
+            or opponents[0] > 0.024
+            or (wrap and (gaps[PALM] > 0.031 or opponents[-1] > 0.026))
+        ):
             continue
         thumb_normal = next(c["normal"] for c in contacts if "thumb" in c["link"])
         opposition = min(
@@ -366,6 +404,13 @@ def refine(controller, family, surface, candidates, others):
             continue
         residual = gravity_residual(contacts, surf.center)
         quality += 0.035 * residual + 0.010 * (1 + opposition)
+        dz = thumb_height(contacts)
+        quality += 2.0 * max(0.0, -0.002 - dz)
+        if wrap:
+            pad_normals = [
+                c["normal"] for c in contacts if c["link"].endswith("_elastomer")
+            ]
+            quality += 0.020 * np.mean([max(abs(n[2]) - 0.16, 0) for n in pad_normals])
         opened = q.copy()
         nonthumb = np.array(
             [
@@ -432,6 +477,7 @@ def refine(controller, family, surface, candidates, others):
             fit_sites=contacts,
             seed_origin=seed["origin"],
             wrench_residual=round(residual, 4),
+            thumb_height_m=round(dz, 5),
             opposite_normal_dot=round(float(opposition), 4),
             fit_gaps=gaps,
             seed_palm_mm=round(
@@ -462,6 +508,7 @@ def refine(controller, family, surface, candidates, others):
         palm_seed_offset_mm=card["seed_palm_mm"],
         joint_seed_rms_rad=card["seed_q_rms"],
         wrench_residual=card["wrench_residual"],
+        thumb_height_m=card["thumb_height_m"],
         opposing_normal_dot=card["opposite_normal_dot"],
         gap_m={k: round(v, 4) for k, v in card["fit_gaps"].items()},
         palm=poses["grasp"].tolist(),

@@ -72,6 +72,20 @@ class NativeBimanualScene:
                 },
             )
 
+        self.fixture_path = None
+        self.bare_tcp_support={}
+        if config.get("wrist_hardware")=="removed":
+            from .scene_wrist_mount import remove_wrist_hardware
+            hardware=remove_wrist_hardware(stage,config["robot_prim"])
+            _save(out/"wrist_assembly.json",hardware)
+            self.bare_tcp_support={side:collision_support(stage,config["robot_prim"]+"/TCP_Link_"+suffix)
+                                   for side,suffix in (("right","R"),("left","L"))}
+        elif "tabletop_seed" in config:
+            from .scene_wrist_mount import resolve_mount, install_mount
+            self.fixture_path = resolve_mount(config.get("wrist_mount"))
+            if self.fixture_path:
+                install_mount(stage, config["robot_prim"], self.fixture_path)
+
         def mapping(key):
             return dict(zip(motors["joint_names"], motors[key][0]))
 
@@ -137,48 +151,54 @@ class NativeBimanualScene:
                 colorize_instance_id_segmentation=False,
             )
         )
-        if config.get("head_wrist_validation"):
+        self.wrist_devices = {}
+        if config.get("head_wrist_validation") and config.get("camera_mode")!="head":
             from .head_wrist_geometry import usd_camera_intrinsics
 
-            wrist_path = config["head_wrist_validation"]["camera_prim"]
-            wrist_prim = stage.GetPrimAtPath(wrist_path)
-            wrist_local = np.asarray(UsdGeom.Xformable(wrist_prim).GetLocalTransformation()).copy()
-            self.tcp_from_wrist_optical = wrist_local.T @ np.diag([1.0, -1.0, -1.0, 1.0])
-            # Native camera optics with a world-space render proxy synchronized
-            # from measured TCP at exposure, independent of USD/Fabric update lag.
-            proxy_path = "/World/DexBridgeRightWristRGBD"
-            proxy = UsdGeom.Camera.Define(stage, proxy_path).GetPrim()
-            for key in (
-                "clippingRange",
-                "focalLength",
-                "horizontalAperture",
-                "verticalAperture",
-                "horizontalApertureOffset",
-                "verticalApertureOffset",
-                "projection",
-            ):
-                proxy.GetAttribute(key).Set(wrist_prim.GetAttribute(key).Get())
-            # The Camera sensor's convenience matrix assumes centered, square pixels.
-            # This USD camera is calibrated with an off-center principal point.
-            focal = wrist_prim.GetAttribute("focalLength").Get()
-            ha = wrist_prim.GetAttribute("horizontalAperture").Get()
-            va = wrist_prim.GetAttribute("verticalAperture").Get()
-            hoff = wrist_prim.GetAttribute("horizontalApertureOffset").Get()
-            voff = wrist_prim.GetAttribute("verticalApertureOffset").Get()
-            self.wrist_K = usd_camera_intrinsics(480, 640, focal, ha, va, hoff, voff)
-            standardize_xform_ops(proxy)
-            self.wrist_camera = Camera(
-                CameraCfg(
-                    prim_path=proxy_path,
-                    spawn=None,
-                    width=480,
-                    height=640,
-                    data_types=data_types,
-                    update_period=0.0,
-                    update_latest_camera_pose=True,
-                    colorize_instance_id_segmentation=False,
+            paths = {"right": config["head_wrist_validation"]["camera_prim"]}
+            if config.get("active_hands") in ("both", "left"):
+                paths["left"] = "/World/Robot/TCP_Link_L/wrist2_camera"
+            for side, wrist_path in paths.items():
+                wrist_prim = stage.GetPrimAtPath(wrist_path)
+                wrist_local = np.asarray(UsdGeom.Xformable(wrist_prim).GetLocalTransformation()).copy()
+                eye = wrist_local.T @ np.diag([1.0, -1.0, -1.0, 1.0])
+                # Native camera optics with a world-space render proxy synchronized
+                # from measured TCP at exposure, independent of USD/Fabric update lag.
+                proxy_path = "/World/DexBridge" + side.title() + "WristRGBD"
+                proxy = UsdGeom.Camera.Define(stage, proxy_path).GetPrim()
+                for key in (
+                    "clippingRange",
+                    "focalLength",
+                    "horizontalAperture",
+                    "verticalAperture",
+                    "horizontalApertureOffset",
+                    "verticalApertureOffset",
+                    "projection",
+                ):
+                    proxy.GetAttribute(key).Set(wrist_prim.GetAttribute(key).Get())
+                # The Camera sensor's convenience matrix assumes centered, square pixels.
+                # This USD camera is calibrated with an off-center principal point.
+                focal = wrist_prim.GetAttribute("focalLength").Get()
+                ha = wrist_prim.GetAttribute("horizontalAperture").Get()
+                va = wrist_prim.GetAttribute("verticalAperture").Get()
+                hoff = wrist_prim.GetAttribute("horizontalApertureOffset").Get()
+                voff = wrist_prim.GetAttribute("verticalApertureOffset").Get()
+                k = usd_camera_intrinsics(480, 640, focal, ha, va, hoff, voff)
+                standardize_xform_ops(proxy)
+                sensor = Camera(
+                    CameraCfg(
+                        prim_path=proxy_path,
+                        spawn=None,
+                        width=480,
+                        height=640,
+                        data_types=data_types,
+                        update_period=0.0,
+                        update_latest_camera_pose=True,
+                        colorize_instance_id_segmentation=False,
+                    )
                 )
-            )
+                self.wrist_devices[side] = (sensor, eye, k)
+            self.wrist_camera, self.tcp_from_wrist_optical, self.wrist_K = self.wrist_devices["right"]
         self.observer_camera = None
         observer = config["images"].get("observer")
         if observer:

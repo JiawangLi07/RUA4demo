@@ -27,6 +27,7 @@ def hand_shapes(scene, q):
     for name in scene.hand_bounds["right"]:
         local = inverse @ scene.tree.pose(name, seed)
         shapes[name] = scene.hand_support[name] @ local[:3, :3].T + local[:3, 3]
+    shapes.update(getattr(scene, "fixture_palm", {}))
     return shapes
 
 

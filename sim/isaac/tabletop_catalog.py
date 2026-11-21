@@ -13,7 +13,7 @@ from .head_wrist_trial import Rejected
 from .paths import RIGHT_JOINTS
 
 
-def load_registry(path, comparison=False):
+def load_registry(path, comparison=False, load_postures=True):
     data = json.loads(path.read_bytes())
     if "schema" not in data:
         if not data or any("seeds" not in row for row in data.values()):
@@ -26,6 +26,8 @@ def load_registry(path, comparison=False):
     objects = data["objects"]
     if not objects or any(set(row) != {"prior"} for row in objects.values()):
         raise ValueError("generic evaluation accepts only a metric mesh per object")
+    if not load_postures:
+        return objects, None
     return objects, SharedPostures(path.resolve().parent / data["shared_postures"])
 
 
