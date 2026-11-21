@@ -115,7 +115,8 @@ def proposals(frame, io, table=None):
 
 
 class Models:
-    def __init__(self, library, mirror=False):
+    def __init__(self, library, mirror=False, rest_faces=False):
+        self.rest_faces = rest_faces
         self.library = library
         self.bundles = {
             name: load_mesh_bundle(row["prior"]) for name, row in library.items()
@@ -168,7 +169,9 @@ class Models:
         surface = RegisteredSurface(self.bundles[name], sample_faces=True)
         if previous is not None:
             surface.fit = previous.fit.copy()
-        info = surface.register(points, table)
+        span = np.ptp(surface.local, axis=0)
+        low_body = span[2] < .075 or np.quantile(points[:, 2], .97) - table < .66*span[2]
+        info = surface.register(points, table, rest_faces=self.rest_faces and low_body)
         pose = np.eye(4)
         pose[:3, :3] = info["pose_world_rotation"]
         pose[:3, 3] = info["pose_world_translation_m"]

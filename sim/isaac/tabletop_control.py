@@ -123,11 +123,13 @@ class Controller:
         shared=None,
         lift_height=0.05,
         lightning=None,
+        adaptive=False,
     ):
         self.io, self.library, self.out = io, library, out
         self.side = getattr(io, "side", "right")
-        self.models = Models(library, mirror=self.side == "left")
+        self.models = Models(library, mirror=self.side == "left", rest_faces=adaptive)
         self.lightning = lightning
+        self.adaptive = adaptive
         self.shared = shared
         if not 0.03 <= lift_height <= 0.20:
             raise ValueError("expected a lift goal between 0.03 and 0.20 metres")
@@ -141,6 +143,7 @@ class Controller:
         self.wrap_cache = {}
         self.template_comparison = template_comparison
         self.tracks = {}
+        self.last_measured_height = False
         self.lift_views = {}
         self.ik = ArmIK(io.tree)
         self.events, self.results = [], {}
@@ -153,6 +156,7 @@ class Controller:
         self.bank = None
         self.hints = {}
         self.table = None
+        self.table_front_x = None
         self.cloud = np.empty((0, 3))
         self.cache = {}
         self.open_hand = self.hand.copy()
@@ -191,6 +195,20 @@ class Controller:
         frame = self.snapshot("wrist" if wrist else "head", "survey")
         self.table, pieces = proposals(frame, self.io, self.table)
         if not wrist:
+            if self.adaptive and self.table_front_x is None:
+                from .tabletop_vision import world_image
+
+                xyz, valid = world_image(frame)
+                observed = xyz[
+                    valid
+                    & (abs(xyz[:, :, 2] - self.table) < 0.0025)
+                    & (xyz[:, :, 0] > 0.35)
+                    & (abs(xyz[:, :, 1]) < 0.55)
+                ]
+                if len(observed) >= 100:
+                    self.table_front_x = (
+                        float(np.quantile(observed[:, 0], 0.005)) - 0.030
+                    )
             self.cloud = (
                 np.vstack([x["xyz"][::4] for x in pieces])
                 if pieces
@@ -302,6 +320,24 @@ class Controller:
                 return False
         return True
 
+    def arm_above_table(self, joints):
+        if self.table_front_x is None:
+            return True
+        angles = dict(zip(ARM, joints))
+        for name, vertices in self.io.model.forearm_support.items():
+            if not name.endswith("_R"):
+                continue
+            frame = self.io.tree.pose(name, angles)
+            # Check the part of each forearm link over the observed tabletop.
+            z = vertices @ frame[2, :3] + frame[2, 3]
+            low = vertices[z < self.table + 0.004]
+            if (
+                len(low)
+                and (low @ frame[0, :3] + frame[0, 3] >= self.table_front_x).any()
+            ):
+                return False
+        return True
+
     def fixture_clear(self, pose):
         return all(
             (vertices @ pose[2, :3]).min() + pose[2, 3] >= self.table + 0.003
@@ -309,6 +345,10 @@ class Controller:
         )
 
     def approach_orientation_clear(self, palm):
+        if getattr(self, "adaptive", False):
+            # An oblique approach to a flat object may lower the knuckles while
+            # its thumb remains lateral or uppermost. Bound radial inversion alone.
+            return bool(palm[2, 1] >= -0.30)
         if self.lightning is None:
             return True
         # The parked hands have fingers upright and the radial axis horizontal.
@@ -322,6 +362,10 @@ class Controller:
         start = self.hand.copy()
         hand = np.clip(hand, *io.model.limits["right"].T)
         joints = np.asarray(joints)
+        if self.adaptive and not swept_clear(
+            joints, lambda arm, _: self.arm_above_table(arm)
+        ):
+            raise NoPath("forearm would intersect the observed tabletop")
         if self.lightning is not None and not swept_clear(
             joints, lambda arm, _: self.approach_orientation_clear(self.ik.fk(arm))
         ):
@@ -378,6 +422,8 @@ class Controller:
 
         def clear_state(q, geometry, vertices):
             palm = self.ik.fk(q)
+            if self.adaptive and not self.arm_above_table(q):
+                return False
             if not self.vertices_clear(palm, vertices, others):
                 return False
             if protected is not None and not protected.clear(
@@ -600,11 +646,43 @@ class Controller:
     def lift_ik(self, palm, pre_joints):
         grasp = self.ik.solve(palm, pre_joints)
         probe = self.ik.solve(shifted(palm, [0, 0, 0.022]), grasp)
-        self.ik.solve(shifted(palm, [0, 0, self.lift_travel]), probe)
+        top = self.ik.solve(shifted(palm, [0, 0, self.lift_travel]), probe)
+        if getattr(self, "adaptive", False) and not all(
+            self.arm_above_table(q) for q in (pre_joints, grasp, probe, top)
+        ):
+            raise NoPath("forearm clearance along closing and lifting branch")
 
     def lightning_lift_ik(self, palm, pre_joints):
         seat = self.ik.solve(shifted(palm, -0.009 * palm[:3, 0]), pre_joints)
         self.lift_ik(palm, seat)
+
+    def check_closure_path(self, origin, arm, grasp, tight):
+        goals = []
+        if origin in ("head_wall_envelope", "lightning_grasp"):
+            standoff = 0.012 if origin == "head_wall_envelope" else 0.009
+            goals.append(shifted(grasp, -standoff * grasp[:3, 0]))
+        goals.extend((grasp, tight))
+        carry_pose = tight
+        if origin == "head_wall_envelope":
+            carry_pose = shifted(tight, 0.006 * tight[:3, 0])
+            goals.append(carry_pose)
+        goals.extend(
+            shifted(carry_pose, [0, 0, dz]) for dz in (0.022, self.lift_travel)
+        )
+        path = [arm]
+        for goal in goals:
+            path.append(self.ik.solve(goal, path[-1]))
+
+        def free(q, _):
+            palm = self.ik.fk(q)
+            return (
+                self.arm_above_table(q)
+                and self.fixture_clear(palm)
+                and self.approach_orientation_clear(palm)
+            )
+
+        if not swept_clear(path, free):
+            raise NoPath("forearm, flange or orientation along approach-to-lift path")
 
     def coarse_surface(self, name, observed):
         from .head_wrist_surface import RegisteredSurface
@@ -729,8 +807,8 @@ class Controller:
         if "wrist" not in self.camera_roles:
             if not accurate:
                 raise NoPath("head mesh registration unconfirmed")
-            from .tabletop_vision import add_live_samples
             from .tabletop_views import ViewBank
+            from .tabletop_vision import add_live_samples
 
             add_live_samples(surface, target, [])
             if self.bank is None:
@@ -888,6 +966,10 @@ class Controller:
         )
 
     def fit_registered(self, name, family, refined, reg, seeds, prior_postures, others):
+        if self.adaptive:
+            from .tabletop_adaptive import select
+
+            return select(self, name, refined, reg, others, prior_postures)
         if self.lightning is not None:
             return self.lightning.select(
                 self, name, refined, reg, others, prior_postures
@@ -960,7 +1042,7 @@ class Controller:
         self.event("selected", posture=s["posture"], yaw_deg=angle, origin=s["origin"])
         return s, poses
 
-    def reacquire_head(self, reference):
+    def reacquire_head(self, reference, *, after_release=False):
         """Match a fresh D455 component near a recently released or occluded target."""
         if reference is None:
             return None
@@ -976,7 +1058,36 @@ class Controller:
             if delta < 0.067 and color < 0.38 and size < 1.15:
                 candidates.append((delta / 0.055 + color + 0.25 * size, p))
         if not candidates:
-            return None
+            if not after_release:
+                return None
+            # A tipped cylinder can move half its own length and exchange its
+            # horizontal and vertical extents. Verify a fresh depth component
+            # against the target mesh before relaxing the old location prior.
+            span = max(reference["dims"])
+            for p in self.head_pieces:
+                delta = np.linalg.norm(p["center"][:2] - reference["center"][:2])
+                color = np.linalg.norm(p["color"] - reference["color"])
+                old = np.maximum(np.sort(reference["dims"]), 0.002)
+                new = np.maximum(np.sort(p["dims"]), 0.002)
+                if (
+                    delta > min(0.17, 0.06 + 0.52 * span)
+                    or color > 0.28
+                    or np.linalg.norm(np.log(new / old)) > 0.95
+                ):
+                    continue
+                try:
+                    _, _, fit = self.models.fit(self.name, p["xyz"], self.table)
+                except ValueError:
+                    continue
+                if (
+                    fit["median_residual_m"] <= 0.0025
+                    and fit["p90_residual_m"] <= 0.007
+                ):
+                    candidates.append(
+                        (0.35 * delta / 0.10 + color + 80.0 * fit["p90_residual_m"], p)
+                    )
+            if not candidates:
+                return None
         candidates.sort(key=lambda item: item[0])
         if len(candidates) > 1 and candidates[1][0] - candidates[0][0] < 0.16:
             return None
@@ -991,6 +1102,7 @@ class Controller:
     def begin_lift(self, surface):
         from .tabletop_tracking import initialize
 
+        self.last_measured_height = False
         self.tracks = {
             role: initialize(self.snapshot(role, "before_lift"), self.io, surface.world)
             for role in self.camera_roles
@@ -1065,25 +1177,42 @@ class Controller:
                 if "geometry_clearance_m" in v
             ]
             if not heights or min(heights) < self.lift_height:
-                vote = "unknown"
+                follows_last_height = (
+                    self.adaptive
+                    and not heights
+                    and self.last_measured_height
+                    and static == 0
+                    and carried >= 24
+                )
+                if not follows_last_height:
+                    vote = "unknown"
+        if not tag.startswith("test_observation") and not self.template_comparison:
+            # A later frame can lose its texture while still strongly matching
+            # the same raised mesh. Establish height metrically before using it.
+            if vote != "carried":
+                self.last_measured_height = False
+            elif tracks or any("geometry_clearance_m" in v for v in votes.values()):
+                self.last_measured_height = True
         self.lift_views = votes
         self.event(tag, vote=vote, views=votes)
         return vote
 
-    def trial(self, observed, result):
-        name = self.name
-        surface, pose, poses, seed, others = self.geometry(name, observed, result)
-        result["prior_postures"].append(seed["posture"])
+    def approach(self, seed, poses, surface, others):
         pre, grasp, tight = [poses[k] for k in ("pre", "grasp", "tight")]
-        qo, qt, qc = [np.array(seed[k]) for k in ("q_open", "q_touch", "q_tight")]
+        qo, qt = [np.asarray(seed[k]) for k in ("q_open", "q_touch")]
         if not self.clear(pre, qo, others) or not self.clear(grasp, qt, others):
-            raise NoPath("wrist refinement invalidated clearance")
+            raise NoPath("registered target invalidated clearance")
+        endpoint_check = None
+        if self.adaptive:
+
+            def endpoint_check(arm):
+                self.check_closure_path(seed["origin"], arm, grasp, tight)
+        elif seed["origin"] == "lightning_grasp":
+
+            def endpoint_check(arm):
+                self.lightning_lift_ik(grasp, arm)
+
         self.event("approach", posture=seed["posture"])
-        endpoint_check = (
-            (lambda arm: self.lightning_lift_ik(grasp, arm))
-            if seed["origin"] == "lightning_grasp"
-            else None
-        )
         self.move(
             pre,
             qo,
@@ -1094,7 +1223,7 @@ class Controller:
             object_margin=0.0005,
             endpoint_check=endpoint_check,
         )
-        if seed["origin"] == "lightning_grasp":
+        if not self.adaptive and seed["origin"] == "lightning_grasp":
             try:
                 self.lightning_lift_ik(grasp, self.arm)
             except NoPath:
@@ -1110,6 +1239,27 @@ class Controller:
                 except NoPath:
                     pass
                 raise NoPath("executed pregrasp has insufficient lift reach")
+
+    def trial(self, observed, result):
+        name = self.name
+        surface, pose, poses, seed, others = self.geometry(name, observed, result)
+        for plan_no in range(4):
+            result["prior_postures"].append(seed["posture"])
+            start = self.io.time()
+            try:
+                self.approach(seed, poses, surface, others)
+                break
+            except NoPath as exc:
+                if not self.adaptive or self.io.time() != start or plan_no == 3:
+                    raise
+                self.event(
+                    "pregrasp_route_rejected", posture=seed["posture"], reason=str(exc)
+                )
+                seed, poses = self.fit_registered(
+                    name, None, surface, pose, (), result["prior_postures"], others
+                )
+        pre, grasp, tight = [poses[k] for k in ("pre", "grasp", "tight")]
+        qo, qt, qc = [np.asarray(seed[k]) for k in ("q_open", "q_touch", "q_tight")]
         first = self.io.fk(PALM)
         close_started = False
         try:
@@ -1127,6 +1277,22 @@ class Controller:
                 self.closing(grasp, qt, 0.65)
                 self.closing(tight, qc, 0.42)
                 self.hold(0.20)
+            elif seed["origin"] == "head_wall_envelope":
+                from .paths import RIGHT_JOINTS
+
+                # Spread the thumb across the near flank, curl the distal joints
+                # first, then draw all four proximal phalanges against the wall.
+                hooked = qo.copy()
+                tips = np.array([n.endswith(("_PIP", "_DIP")) for n in RIGHT_JOINTS])
+                hooked[tips] += 0.52 * (qt[tips] - qo[tips])
+                seat = shifted(grasp, -0.012 * grasp[:3, 0])
+                self.closing(seat, hooked, 0.68)
+                opposed = hooked + 0.44 * (qt - hooked)
+                opposed[:5] = qo[:5] + 0.76 * (qt[:5] - qo[:5])
+                self.closing(grasp, opposed, 0.68)
+                self.closing(tight, qt, 0.65)
+                self.closing(tight, qc, 0.35)
+                self.hold(0.18)
             elif seed["origin"] == "wrist_handle_cross_sections":
                 from .tabletop_handle import seat, surround_handle
 
@@ -1154,11 +1320,28 @@ class Controller:
                 self.closing(grasp, qt, 0.72)
                 self.closing(tight, qc, 0.46)
                 self.hold(0.22)
+            self.event("closure_completed", posture=seed["posture"])
             palm0 = self.io.fk(PALM)
             first = palm0
             if not self.template_comparison:
                 self.begin_lift(surface)
-            carry = self.hand
+            carry = self.hand.copy()
+            if seed["origin"] == "head_wall_envelope":
+                # Compensate finger compliance on the wall while seating the
+                # palm. Keep this motor target through the probe and final lift.
+                upper = self.io.model.limits["right"][:, 1]
+                for j, joint in enumerate(RIGHT_JOINTS):
+                    if joint.endswith(("MCP_FE", "_PIP", "_DIP", "_IP")):
+                        preload = 0.22 if "_ring_" in joint else 0.13
+                        if "_thumb_" in joint:
+                            preload = 0.07
+                        carry[j] = min(upper[j], carry[j] + preload)
+                from .tabletop_adaptive import draw_pads_to_palm
+
+                carry = draw_pads_to_palm(self, carry, 0.009)
+                self.closing(shifted(palm0, 0.006 * palm0[:3, 0]), carry, 0.52)
+                palm0 = self.io.fk(PALM)
+                first = palm0
             if sites:
                 from .tabletop_meshfit import carry_shape
 
@@ -1187,8 +1370,44 @@ class Controller:
                     surface, pose, palm0, observed["color"], "test_observation_repeat"
                 )
             if verdict != "carried":
-                return verdict
-            self.move(shifted(palm0, [0, 0, self.lift_travel]), self.hand, 0.65)
+                # When the closing hand masks the object, static/raised mesh
+                # hypotheses can be visually indistinguishable at 22 mm. Allow
+                # the bounded verification motion unless texture stayed fixed.
+                stationary = any(
+                    v.get("texture_inliers", 0) >= 5
+                    and abs(v["tracked_rise_m"]) < 0.004
+                    and abs(v["tracked_bottom_rise_m"]) < 0.004
+                    for v in self.lift_views.values()
+                )
+                if not self.adaptive or stationary:
+                    return verdict
+                self.event("continue_visual_probe", initial_vote=verdict)
+            top = shifted(palm0, [0, 0, self.lift_travel])
+            if seed["origin"] == "head_wall_envelope":
+                from .tabletop_adaptive import thumb_up_carry
+
+                upright = thumb_up_carry(self, top, qt)
+                try:
+                    if not self.clear(upright, self.hand, others):
+                        raise NoPath("no clearance for a thumb-up carry")
+                    self.move(upright, self.hand, 0.65)
+                    self.event(
+                        "thumb_up_carry",
+                        rotation_deg=round(
+                            float(
+                                np.rad2deg(
+                                    Rotation.from_matrix(
+                                        upright[:3, :3] @ top[:3, :3].T
+                                    ).magnitude()
+                                )
+                            ),
+                            2,
+                        ),
+                    )
+                except NoPath:
+                    self.move(top, self.hand, 0.65)
+            else:
+                self.move(top, self.hand, 0.65)
             if not self.template_comparison:
                 # A compliant object can tilt or slip a little even as it follows the hand.
                 # Use the observed motion of its bottom before starting the hold clock.
@@ -1227,7 +1446,14 @@ class Controller:
                 verdicts.append(
                     self.vote(surface, pose, palm0, observed["color"], f"hold_{i + 1}")
                 )
-                if verdicts[-1] == "on_table":
+                if verdicts[-1] == "on_table" and (
+                    not self.adaptive
+                    or any(
+                        v.get("texture_inliers", 0) >= 5
+                        and abs(v["tracked_rise_m"]) < 0.004
+                        for v in self.lift_views.values()
+                    )
+                ):
                     break
             self.event("hold_end")
             return (
@@ -1257,11 +1483,30 @@ class Controller:
                     back = np.array([-0.3, -0.2, 0.8])
                 back = back / np.linalg.norm(back) * 0.042
                 back[2] = max(back[2], 0.016)
-                try:
-                    self.move(shifted(self.io.fk(PALM), back), qo, 0.40)
-                except NoPath:
-                    pass
-                self.event("local_withdraw")
+                if self.adaptive:
+                    # Clear the target before planning the next guarded approach.
+                    # Releasing inside its silhouette otherwise blocks every retry.
+                    start = self.io.fk(PALM)
+                    for offset in (
+                        1.7 * back + [0, 0, 0.018],
+                        1.3 * back + [0, 0, 0.045],
+                        back,
+                    ):
+                        dest = shifted(start, offset)
+                        if not surface.clear(self.link_shapes(qo), dest, 0.002):
+                            continue
+                        try:
+                            self.move(dest, qo, 0.48, others, transit=True)
+                        except NoPath:
+                            continue
+                        self.event("local_withdraw", translation_m=offset.tolist())
+                        break
+                else:
+                    try:
+                        self.move(shifted(self.io.fk(PALM), back), qo, 0.40)
+                    except NoPath:
+                        pass
+                    self.event("local_withdraw")
 
     def closing(self, goal, hand, seconds):
         start = self.arm.copy()
@@ -1288,6 +1533,14 @@ class Controller:
                 ):
                     anchors[name] = head[name]
                     continue
+                if (
+                    self.adaptive
+                    and name not in feedback
+                    and "wrist" not in self.camera_roles
+                ):
+                    current = self.reacquire_head(ref)
+                    if current is not None:
+                        feedback[name] = current
                 # Use the last observed location to direct a fresh wrist exposure during occlusion.
                 if "wrist" in self.camera_roles:
                     feedback[name] = ref
@@ -1307,13 +1560,29 @@ class Controller:
             self.name = min(pending, key=priority)
             pending.remove(self.name)
             self.attempt = 0
-            result = {"hand": self.side, "prior_postures": [], "outcomes": []}
+            file = self.out / "decisions.json"
+            previous_decisions = json.loads(file.read_bytes()) if file.exists() else {}
+            earlier = previous_decisions.get(self.name, {})
+            offset = len(earlier.get("outcomes", ()))
+            result = {
+                "hand": self.side,
+                "prior_postures": [],
+                "outcomes": list(earlier.get("outcomes", ())),
+                "attempt_hands": list(
+                    earlier.get("attempt_hands", [earlier.get("hand")] * offset)
+                ),
+            }
+
             self.results[self.name] = result
+            last_seen = feedback.get(self.name)
             attempts = 3 if self.lightning is not None else 2
             for index in range(1, attempts + 1):
-                self.attempt = index
+                self.attempt = index + offset
+                result["attempt_hands"].append(self.side)
                 self.event("attempt_start")
                 observed = feedback.get(self.name)
+                if observed is not None:
+                    last_seen = observed
                 if "wrist" in self.camera_roles and (
                     observed is None or observed["match_cost"] > 1.65
                 ):
@@ -1347,7 +1616,7 @@ class Controller:
                 self.event("attempt_end", reason=reason)
                 file = self.out / "decisions.json"
                 previous = json.loads(file.read_bytes()) if file.exists() else {}
-                save(file, dict(previous, **self.results))
+                save(file, dict(previous, **{self.name: result}))
                 if reason == "vision_pass" or (
                     index == 1
                     and not result["prior_postures"]
@@ -1363,8 +1632,12 @@ class Controller:
                 if index < attempts:
                     fresh = self.survey()
                     if "wrist" not in self.camera_roles:
-                        previous = feedback.pop(self.name, None)
-                        local = self.reacquire_head(previous)
+                        feedback.pop(self.name, None)
+                        released = self.adaptive and any(
+                            e["name"] == self.name and e["phase"] == "closure_completed"
+                            for e in self.events
+                        )
+                        local = self.reacquire_head(last_seen, after_release=released)
                         if local is not None:
                             feedback[self.name] = local
                     if self.name in fresh and (

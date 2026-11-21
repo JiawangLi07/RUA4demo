@@ -253,6 +253,7 @@ def connect(scene, out, side="right", audit=None):
         hand_names=scene.hand_names,
         hand_bounds=scene.hand_bounds,
         hand_support=scene.hand_support,
+        forearm_support=scene.forearm_support,
         limits=scene.limits,
     )
     if side in scene.bare_tcp_support:

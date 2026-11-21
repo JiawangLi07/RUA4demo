@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.optimize import least_squares
-from scipy.spatial import cKDTree
+from scipy.spatial import ConvexHull, cKDTree
 from scipy.spatial.transform import Rotation
 
 from .head_wrist_geometry import hand_shapes
@@ -51,7 +51,7 @@ class RegisteredSurface:
             self.detail_points = (1-u[:, None])*tri[ids, 0] + (u*(1-v))[:, None]*tri[ids, 1] + (u*v)[:, None]*tri[ids, 2]
             self.detail_normals = normal[ids]
 
-    def register(self, observed, table):
+    def register(self, observed, table, *, rest_faces=False):
         points = observed[:: max(1, len(observed) // 680)]
         zlo = self.support[:, 2].min()
         prior = self.fit
@@ -71,6 +71,41 @@ class RegisteredSurface:
             starts = [np.array([*center, a, 0.0, 0.0]) for a in np.arange(0, 2 * np.pi, np.pi / 4)]
             coarse = sorted(starts, key=lambda p: np.mean(np.minimum(residual(p), 0.024)))[:4]
             bounds = ([*(center - 0.12), -2 * np.pi, -0.40, -0.40], [*(center + 0.12), 4 * np.pi, 0.40, 0.40])
+            if rest_faces:
+                # A newly placed small object can roll onto a different face
+                # while settling. Generate support-normal and yaw hypotheses
+                # from the metric hull; score only using the head depth.
+                extra = []
+                hull = ConvexHull(self.support)
+                triangles = self.support[hull.simplices]
+                area = np.linalg.norm(np.cross(triangles[:,1]-triangles[:,0], triangles[:,2]-triangles[:,0]),axis=1)
+                chosen = []
+                for i in np.argsort(-area):
+                    normal = hull.equations[i,:3]
+                    if normal[2] < -.94 or any(normal @ n > .90 for n in chosen):
+                        continue
+                    chosen.append(normal)
+                    down = np.array([0., 0., -1.])
+                    cross = np.cross(normal, down)
+                    norm = np.linalg.norm(cross)
+                    if norm < 1e-8:
+                        rest = Rotation.from_euler("x",np.pi)
+                    else:
+                        rest = Rotation.from_rotvec(cross/norm * np.arccos(np.clip(normal @ down, -1., 1.)))
+                    for yaw in np.arange(0, 2*np.pi, np.pi/4):
+                        r = Rotation.from_euler("z",yaw) * rest
+                        a = r.as_matrix()
+                        xy = center - (np.quantile(self.local @ a.T, [.01,.99],axis=0).mean(0)[:2])
+                        seed = np.r_[xy,r.as_euler("zyx")]
+                        rot,shift = pose(seed)
+                        err = self.tree.query((points[::4]-shift) @ rot)[0]
+                        extra.append((float(np.mean(np.minimum(err,.016))), seed))
+                    if len(chosen) >= 10:
+                        break
+                extra.sort(key=lambda x:x[0])
+                coarse += [seed for _,seed in extra[:5]]
+                bounds = ([*(center-.12), -2*np.pi, -np.pi, -2*np.pi],
+                          [*(center+.12), 4*np.pi, np.pi, 2*np.pi])
         else:
             coarse = [prior]
             span = np.array([0.035, 0.035, 0.42, 0.22, 0.22])

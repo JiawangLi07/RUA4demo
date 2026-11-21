@@ -264,6 +264,15 @@ class NativeBimanualScene:
                     bounds = collision_bounds(stage, config["robot_prim"] + "/" + name, cache)
                     if bounds is not None:
                         self.arm_mask_bounds[name] = bounds
+        self.forearm_support = {}
+        if config.get("check_forearm_table"):
+            for side in ("R", "L"):
+                for j in range(4, 8):
+                    name = f"Link{j}_{side}"
+                    points = collision_support(stage, config["robot_prim"] + "/" + name)
+                    # Keep the surface of each physical CAD collider at millimetre resolution.
+                    _, ids = np.unique(np.round(points / 0.002), axis=0, return_index=True)
+                    self.forearm_support[name] = points[ids]
         self.object_bounds = {
             name: collision_bounds(stage, path, cache) for name, path in config["object_prims"].items()
         }

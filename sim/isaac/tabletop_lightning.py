@@ -229,12 +229,18 @@ class LightningBank:
         }
         # The right and mirrored-left controller both use a canonical right palm.
         # +Y is radial (pinky towards index), +Z points from wrist to knuckles.
-        eligible &= (
-            (poses[:, 2, 1] >= 0.25)
-            & (poses[:, 2, 2] >= -0.15)
-            & (pad_dz >= 0.004)
-            & thumb.any(1)
-        )
+        adaptive = getattr(ctrl, "adaptive", False) and not power_body
+        if adaptive:
+            # Keep opposed contacts and prefer the thumb above the other pads in
+            # the score. A short low object may require knuckles directed down.
+            eligible &= (poses[:, 2, 1] >= -0.25) & (pad_dz >= -0.014) & thumb.any(1)
+        else:
+            eligible &= (
+                (poses[:, 2, 1] >= 0.25)
+                & (poses[:, 2, 2] >= -0.15)
+                & (pad_dz >= 0.004)
+                & thumb.any(1)
+            )
         counts["thumb_up"] = int(eligible.sum())
         supported = digits.copy()
         if power_body:
@@ -254,7 +260,7 @@ class LightningBank:
                         if np.quantile(surface.tree.query(points)[0], 0.05) <= 0.006:
                             supported[i, j] = True
                             break
-        eligible &= digits.sum(1) >= 3
+        eligible &= digits.sum(1) >= (2 if adaptive else 3)
         # Prefer a full wrap whenever the arm can execute it. Narrow surfaces
         # and obstructed approaches can still support an upright opposed grip.
         tier = np.ones(len(poses), dtype=int)
@@ -344,7 +350,12 @@ class LightningBank:
                 for seed in ik_seeds:
                     try:
                         solved = ctrl.ik.solve(pre, seed)
-                        ctrl.lightning_lift_ik(palm, solved)
+                        if getattr(ctrl, "adaptive", False):
+                            ctrl.check_closure_path(
+                                "lightning_grasp", solved, palm, palm
+                            )
+                        else:
+                            ctrl.lightning_lift_ik(palm, solved)
                         break
                     except NoPath:
                         solved = None

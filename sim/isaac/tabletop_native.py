@@ -15,6 +15,11 @@ def main():
     parser.add_argument("--scene", type=Path, required=True)
     parser.add_argument("--library", type=Path)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--adaptive-grasps",
+        action="store_true",
+        help="use mesh-conditioned wall envelopes, oblique opposition and hand reassignment",
+    )
     parser.add_argument("--observe-only", action="store_true")
     parser.add_argument("--camera-mode", choices=("head", "head-wrist"), default="head")
     parser.add_argument(
@@ -73,6 +78,7 @@ def main():
 
         config = json.loads(args.scene.read_bytes())
         config["active_hands"] = args.hands
+        config["check_forearm_table"] = args.adaptive_grasps
         config["camera_mode"] = args.camera_mode
         config["wrist_hardware"] = hardware
         if args.wrist_mount:
@@ -98,18 +104,26 @@ def main():
                 spec, shared = load_registry(
                     args.library,
                     args.template_comparison,
-                    load_postures=args.lightning_candidates is None,
+                    load_postures=args.adaptive_grasps
+                    or args.lightning_candidates is None,
                 )
+                if args.adaptive_grasps and shared is None:
+                    parser.error(
+                        "--adaptive-grasps requires a metric registry and its shared posture catalog"
+                    )
                 (out / "trial_settings.json").write_text(
                     json.dumps(
                         {
                             "lift_height_m": args.lift_height_m,
                             "grasp_inputs": "rgbd_mesh_commanded_kinematics",
                             "joint_observation": "issued_targets",
+                            "closure_telemetry": "completed_command",
                             "hands": sides,
                             "camera_mode": args.camera_mode,
                             "wrist_hardware": hardware,
-                            "solver": "lightning_grasp"
+                            "solver": "adaptive_mesh_and_lightning"
+                            if args.adaptive_grasps
+                            else "lightning_grasp"
                             if args.lightning_candidates
                             else "mesh_fit",
                             "mount_installed": scene.fixture_path is not None,
@@ -133,6 +147,7 @@ def main():
                             shared,
                             args.lift_height_m,
                             bank,
+                            args.adaptive_grasps,
                         )
                     )
                 targets = list(args.target or spec)
@@ -161,9 +176,30 @@ def main():
                         groups[group].append(name)
                     for i, ctrl in enumerate(controllers):
                         ctrl.event("hand_assignment", targets=groups[i])
-                        ctrl.execute(groups[i], finish=i == 1)
+                        ctrl.execute(
+                            groups[i], finish=i == 1 and not args.adaptive_grasps
+                        )
                         if i == 0 and groups[i]:
                             ctrl.leave_low_pose()
+                    if args.adaptive_grasps:
+                        # Give unexecuted targets to the opposite arm after its
+                        # partner has cleared the view. Obtain fresh head depth.
+                        for i in (1, 0):
+                            partner = controllers[1 - i]
+                            closed = {
+                                e["name"]
+                                for e in partner.events
+                                if e["phase"] == "closure_completed"
+                            }
+                            waiting = [n for n in groups[1 - i] if n not in closed]
+                            if waiting:
+                                if i == 0:
+                                    controllers[1].leave_low_pose()
+                                controllers[i].event(
+                                    "hand_reassignment", targets=waiting
+                                )
+                                controllers[i].execute(waiting, finish=False)
+                        controllers[0].event("episode_end")
         finally:
             audit.save()
             (out / "sensor_usage.json").write_text(

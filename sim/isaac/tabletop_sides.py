@@ -71,6 +71,10 @@ def canonical_left(io):
         name: mirrored_vertices(name, io.model.hand_support[opposite(name)])
         for name in io.model.hand_support
     }
+    forearms = getattr(io.model, "forearm_support", {})
+    model.forearm_support = {
+        name: mirrored_vertices(name, forearms[opposite(name)]) for name in forearms
+    }
     model.fixture_palm = {
         name: mirrored_vertices("right_hand_C_MC", v)
         for name, v in io.model.fixture_palm.items()

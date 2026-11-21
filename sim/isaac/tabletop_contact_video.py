@@ -2,12 +2,13 @@
 
 import argparse
 import json
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
 from sim.isaac.scene_meshes import load_mesh_bundle
 from sim.isaac.tabletop_score import path_minimum
 from sim.isaac.tabletop_video import PHASES, TARGETS
@@ -47,26 +48,29 @@ def main():
             for key, label in scene["evaluation_aliases"].items()
             if label == args.target
         )
-        side = decisions[code].get("hand", "right")
-        link = z[side + "_link_names"].tolist().index(side + "_hand_C_MC")
-        load = np.column_stack(
-            (
-                z[side + "_link_load_N"][:, link, body],
-                z[side + "_digit_load_N"][:, :, body],
+        decision = decisions[code]
+        hands = decision.get("attempt_hands") or [decision.get("hand", "right")]
+        loads = {}
+        for side in set(hands):
+            link = z[side + "_link_names"].tolist().index(side + "_hand_C_MC")
+            loads[side] = np.column_stack(
+                (
+                    z[side + "_link_load_N"][:, link, body],
+                    z[side + "_digit_load_N"][:, :, body],
+                )
             )
-        )
         lower = 100 * (
             path_minimum(z["pose_wxyz"][:, body], points) - float(z["table_z"])
         )
         dt = float(z["dt"])
     labels = ["中央掌面", "拇指", "食指", "中指", "无名指", "小指"]
-    title = (
-        ("左手" if side == "left" else "右手")
-        + " · "
-        + TARGETS.get(args.target, args.target)
-    )
     frames = json.loads((run / "frames.json").read_bytes())
     events = [json.loads(x) for x in (run / "events.jsonl").read_text().splitlines()]
+    changes = [(0.0, hands[0])]
+    for event in events:
+        if event["name"] == code and event["phase"] == "attempt_start":
+            changes.append((event["time"], hands[event["attempt"] - 1]))
+    hand_index = 0
     phases = [(0.0, "双臂竖掌，开始观察桌面")]
     for e in events:
         name = scene["evaluation_aliases"].get(e["name"], "")
@@ -132,6 +136,17 @@ def main():
         image.paste(Image.fromarray(zoom), (768, 0))
         d = ImageDraw.Draw(image)
         time = frame["sim_time"]
+        while (
+            hand_index + 1 < len(changes) and changes[hand_index + 1][0] <= time + 1e-6
+        ):
+            hand_index += 1
+        side = changes[hand_index][1]
+        load = loads[side]
+        title = (
+            ("左手" if side == "left" else "右手")
+            + " · "
+            + TARGETS.get(args.target, args.target)
+        )
         step = np.clip(round(time / dt) - 1, 0, len(load) - 1)
         while phase + 1 < len(phases) and phases[phase + 1][0] <= time + 1e-6:
             phase += 1
@@ -152,7 +167,7 @@ def main():
         d.text((16, 583), title, font=small, fill=(87, 99, 101))
         for i, (label, force) in enumerate(zip(labels, load[step])):
             left = 174 + 182 * i
-            color = (33, 104, 94) if force > 0.05 else (102, 110, 112)
+            color = (33, 104, 94) if force > 0.25 else (102, 110, 112)
             d.text((left, 552), label, font=font, fill=color)
             d.text((left, 578), f"{force:.2f} N", font=small, fill=color)
             d.rounded_rectangle((left, 611, left + 146, 616), 2, fill=(218, 222, 219))

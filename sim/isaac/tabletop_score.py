@@ -2,6 +2,7 @@
 
 import argparse
 import json
+from functools import cache
 from pathlib import Path
 
 import numpy as np
@@ -21,15 +22,13 @@ def path_minimum(pose, vertices):
 
 
 def evaluate(scene, directory, lift_height=None):
+    settings_path = directory / "trial_settings.json"
+    settings = json.loads(settings_path.read_bytes()) if settings_path.is_file() else {}
     if lift_height is None:
-        settings = directory / "trial_settings.json"
-        lift_height = (
-            json.loads(settings.read_bytes())["lift_height_m"]
-            if settings.is_file()
-            else 0.09
-        )
+        lift_height = settings.get("lift_height_m", 0.09)
     if not np.isfinite(lift_height) or lift_height <= 0:
         raise ValueError("lift height must be positive metres")
+    explicit_closure = settings.get("closure_telemetry") == "completed_command"
     events = [
         json.loads(s) for s in (directory / "events.jsonl").read_text().splitlines()
     ]
@@ -61,30 +60,32 @@ def evaluate(scene, directory, lift_height=None):
     def tick(t):
         return int(np.clip(round(t / dt) - 1, 0, length - 1))
 
+    @cache
+    def channel(side, key):
+        name = side + "_" + key
+        return recording[name] if name in recording.files else recording[key]
+
+    @cache
+    def hardware_clearance(side, part):
+        key = side + "_" + part + "_tcp_vertices"
+        if key in recording.files:
+            return path_minimum(channel(side, "tcp_wxyz"), recording[key]) - table
+        return None
+
     for name, decision in decisions.items():
         physical_name = scene.get("evaluation_aliases", {}).get(name, name)
         target = names.index(physical_name)
-        side = decision.get("hand", "right")
-
-        def channel(key):
-            name = side + "_" + key
-            return recording[name] if name in recording.files else recording[key]
-
-        palm, forces = channel("palm_wxyz"), channel("hand_load_N")
-        fixture_key = side + "_fixture_tcp_vertices"
-        fixture_min = (
-            path_minimum(recording[side + "_tcp_wxyz"], recording[fixture_key]) - table
-            if fixture_key in recording.files
-            else None
+        outcomes = decision["outcomes"]
+        hands = decision.get(
+            "attempt_hands", [decision.get("hand", "right")] * len(outcomes)
         )
-        flange_key = side + "_flange_tcp_vertices"
-        flange_min = (
-            path_minimum(recording[side + "_tcp_wxyz"], recording[flange_key]) - table
-            if flange_key in recording.files
-            else None
-        )
+        if len(hands) != len(outcomes):
+            raise ValueError("attempt and physical hand counts disagree")
         tries = []
-        for index, why in enumerate(decision["outcomes"], 1):
+        for index, (side, why) in enumerate(zip(hands, outcomes), 1):
+            palm, forces = channel(side, "palm_wxyz"), channel(side, "hand_load_N")
+            fixture_min = hardware_clearance(side, "fixture")
+            flange_min = hardware_clearance(side, "flange")
             ev = [e for e in events if e["name"] == name and e["attempt"] == index]
             phases = {e["phase"]: e for e in ev}
             first, last = (
@@ -95,18 +96,28 @@ def evaluate(scene, directory, lift_height=None):
             release_time = phases.get("lower_and_release", phases["attempt_end"])[
                 "time"
             ]
-            executed = close_time is not None and release_time - close_time >= 0.70
+            evidence = "none" if close_time is None else "requested_only"
+            if close_time is not None:
+                if "closure_completed" in phases:
+                    evidence = "completed_command"
+                elif not explicit_closure and "test_lift" in phases:
+                    evidence = "test_lift"
+                elif not explicit_closure and release_time - close_time >= 0.70:
+                    evidence = "elapsed_only"
             row = {
                 "attempt": index,
                 "hand": side,
                 "online": why,
-                "closure": executed,
+                "closure": evidence
+                in ("completed_command", "test_lift", "elapsed_only"),
+                "closure_evidence": evidence,
                 "closure_requested": close_time is not None,
                 "wrist_refined": "registered_wrist" in phases,
                 "head_only_grasp": "head_only_grasp" in phases,
                 "stable": False,
                 "raised": False,
                 "held_through_end": False,
+                "full_palm_held_2s": False,
                 "start_s": round((first + 1) * dt, 3),
                 "end_s": round((last + 1) * dt, 3),
             }
@@ -132,6 +143,8 @@ def evaluate(scene, directory, lift_height=None):
                 row["predicted_thumb_height_difference_m"] = phases["selected"][
                     "thumb_above_mean_fingers_m"
                 ]
+            if "selected" in phases:
+                row["solver_origin"] = phases["selected"].get("origin")
                 if "approach" in phases:
                     u = tick(phases["approach"]["time"])
                     v = tick(release_time)
@@ -165,11 +178,14 @@ def evaluate(scene, directory, lift_height=None):
                 b = bottom[sl, target]
                 load = forces[sl, target]
                 rise = t[:, 2] - t[0, 2]
+                bearing = None
                 if "hold_start" in phases and "hold_end" in phases:
                     u = tick(phases["hold_start"]["time"]) - a
                     v = tick(phases["hold_end"]["time"]) - a
                     if "digit_load_N" in recording.files:
-                        digits = channel("digit_load_N")[a + u : a + v + 1, :, target]
+                        digits = channel(side, "digit_load_N")[
+                            a + u : a + v + 1, :, target
+                        ]
                         row["four_fingers_loaded_hold_fraction"] = round(
                             float(np.mean((digits[:, 1:] > 0.25).all(1))), 4
                         )
@@ -184,7 +200,7 @@ def evaluate(scene, directory, lift_height=None):
                         )
                     pad_key = side + "_pad_center_z_m"
                     if pad_key in recording.files:
-                        heights = recording[pad_key][a + u : a + v + 1]
+                        heights = channel(side, "pad_center_z_m")[a + u : a + v + 1]
                         diff = heights[:, 0] - heights[:, 1:].mean(1)
                         row["actual_thumb_above_four_median_m"] = round(
                             float(np.median(diff)), 5
@@ -193,12 +209,22 @@ def evaluate(scene, directory, lift_height=None):
                     if link_key in recording.files:
                         names_by_link = recording[side + "_link_names"].tolist()
                         if side + "_hand_C_MC" in names_by_link:
-                            palm_load = recording[link_key][
+                            palm_load = channel(side, "link_load_N")[
                                 a + u : a + v + 1,
                                 names_by_link.index(side + "_hand_C_MC"),
                                 target,
                             ]
                             row["palm_mean_hold_N"] = round(float(palm_load.mean()), 3)
+                            if "digit_load_N" in recording.files:
+                                bearing = (digits[:, 1:] > 0.25).all(1) & (
+                                    palm_load > 0.25
+                                )
+                                row["four_and_palm_hold_fraction"] = round(
+                                    float(bearing.mean()), 4
+                                )
+                                row["four_and_palm_all_hold_ticks"] = bool(
+                                    bearing.all()
+                                )
                     row.update(
                         hold_phase_s=round(float((v - u) * dt), 4),
                         hold_phase_minimum_rise_m=round(
@@ -251,6 +277,12 @@ def evaluate(scene, directory, lift_height=None):
                             and drift.max() <= 0.03
                             and angle.max() <= 0.5
                         )
+                        row["full_palm_held_2s"] = bool(
+                            row["held_through_end"]
+                            and bearing is not None
+                            and len(bearing) >= window
+                            and bearing[-window:].all()
+                        )
                 for u, v in spans:
                     for start in range(u, v - window + 1):
                         stop = start + window
@@ -266,7 +298,7 @@ def evaluate(scene, directory, lift_height=None):
                         )
                         if dp <= 0.03 and dr <= 0.5:
                             if "digit_load_N" in recording.files:
-                                window_loads = channel("digit_load_N")[
+                                window_loads = channel(side, "digit_load_N")[
                                     a + start : a + stop, :, target
                                 ]
                                 digits = recording["digit_names"].tolist()
@@ -315,6 +347,13 @@ def evaluate(scene, directory, lift_height=None):
         "objects": len(scores),
         "required_lift_m": lift_height,
         "closed": sum(any(r["closure"] for r in rows) for rows in scores.values()),
+        "confirmed_closures": sum(
+            any(
+                r["closure_evidence"] in ("completed_command", "test_lift")
+                for r in rows
+            )
+            for rows in scores.values()
+        ),
         "loaded": sum(
             any(r.get("hand_contact_s", 0) > 0 for r in rows)
             for rows in scores.values()
@@ -323,6 +362,9 @@ def evaluate(scene, directory, lift_height=None):
         "raised": sum(any(r["raised"] for r in rows) for rows in scores.values()),
         "held_through_end": sum(
             any(r["held_through_end"] for r in rows) for rows in scores.values()
+        ),
+        "full_palm_held_objects": sum(
+            any(r["full_palm_held_2s"] for r in rows) for rows in scores.values()
         ),
         "visual_pass": sum(
             any(r["online"] == "vision_pass" for r in rows) for rows in scores.values()

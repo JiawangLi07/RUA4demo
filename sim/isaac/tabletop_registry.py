@@ -27,7 +27,8 @@ def import_mesh(path, scale, up):
     mesh.remove_unreferenced_vertices()
     vis = mesh.visual
     if vis.kind == "texture":
-        vis = vis.to_color()
+        mesh.visual = vis.to_color()
+        vis = mesh.visual
     rgb = np.asarray(vis.face_colors[:, :3], float) / 255
     color = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
     mesh.apply_translation(-mesh.bounds.mean(0))

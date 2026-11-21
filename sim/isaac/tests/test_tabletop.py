@@ -104,7 +104,54 @@ def test_offline_score_requires_an_executed_closure_and_two_loaded_seconds(
     result = tabletop_score.evaluate(scene, tmp_path)
     assert result["stable"] == 1 and result["closed"] == 1
     assert result["raised"] == 1 and result["held_through_end"] == 1
+    assert result["confirmed_closures"] == 0
+    assert result["per_object"]["test"][1]["closure_evidence"] == "elapsed_only"
     assert not result["per_object"]["test"][0]["closure"]
+    # Reassignment changes the physical load channel and keeps unique attempt IDs.
+    (tmp_path / "decisions.json").write_text(
+        json.dumps(
+            {
+                "test": {
+                    "outcomes": ["arm IK", "vision_pass"],
+                    "attempt_hands": ["right", "left"],
+                }
+            }
+        )
+    )
+    recording.update(
+        left_hand_load_N=forces.copy(), right_hand_load_N=np.zeros_like(forces)
+    )
+    np.savez(tmp_path / "physics_audit.npz", **recording)
+    (tmp_path / "trial_settings.json").write_text(
+        json.dumps({"lift_height_m": 0.05, "closure_telemetry": "completed_command"})
+    )
+    assert tabletop_score.evaluate(scene, tmp_path)["closed"] == 0
+    events.append(
+        {"name": "test", "time": 1.25, "phase": "closure_completed", "attempt": 2}
+    )
+    (tmp_path / "events.jsonl").write_text("\n".join(json.dumps(e) for e in events))
+    rows = tabletop_score.evaluate(scene, tmp_path)["per_object"]["test"]
+    assert [(r["hand"], r["closure"]) for r in rows] == [
+        ("right", False),
+        ("left", True),
+    ]
+    assert rows[1]["held_through_end"]
+    assert rows[1]["closure_evidence"] == "completed_command"
+    assert not rows[1]["full_palm_held_2s"]
+    digit_loads = np.ones((n, 5, 1))
+    palm_loads = np.ones((n, 1, 1))
+    recording.update(
+        digit_names=["thumb", "index", "middle", "ring", "pinky"],
+        digit_load_N=digit_loads,
+        left_link_names=["left_hand_C_MC"],
+        left_link_load_N=palm_loads,
+    )
+    np.savez(tmp_path / "physics_audit.npz", **recording)
+    assert tabletop_score.evaluate(scene, tmp_path)["full_palm_held_objects"] == 1
+    digit_loads[350, 3, 0] = 0.0
+    np.savez(tmp_path / "physics_audit.npz", **recording)
+    assert tabletop_score.evaluate(scene, tmp_path)["full_palm_held_objects"] == 0
+    del recording["left_hand_load_N"], recording["right_hand_load_N"]
     # A 6 cm raise clears the current 5 cm acceptance height, but misses the earlier goal.
     obj[140:390, 0, 2] -= 0.045
     palm[140:390, 2] -= 0.045
