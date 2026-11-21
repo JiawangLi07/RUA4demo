@@ -17,6 +17,13 @@ PALM = "right_hand_C_MC"
 DIGITS = ("thumb", "index", "middle", "ring", "pinky")
 
 
+def native_collision_mask(flags, count):
+    """v1 returns integer 0/1 flags, one flag per native pose."""
+    if tuple(flags.shape) != (count,):
+        raise ValueError("collision kernel returned a different number of rows")
+    return flags.bool()
+
+
 def prepare(api, torch, args):
     from lygra.contact_field import build_contact_field
     from lygra.robot.base import RobotInterface
@@ -145,9 +152,8 @@ def side_placements(torch, field, tree, static, pts, normals, obj, args):
     idx = torch.where(clear)[0]
     if len(idx):
         points = pts @ rot[idx].transpose(1, 2) + pos[idx, None]
-        idx = idx[batch_object_hand_collision_check(tree, points, mesh=static)][
-            : args.outer
-        ]
+        no_collision = batch_object_hand_collision_check(tree, points, mesh=static)
+        idx = idx[native_collision_mask(no_collision, len(idx))][: args.outer]
     return pose[idx], {
         "extra_contact_pos": (site[:, :3] + stand_off * unit(site[:, 3:]))[idx, None],
         "extra_contact_normal": site[idx, None, 3:],

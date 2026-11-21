@@ -166,6 +166,26 @@ def test_lightning_lift_uses_actual_seating_branch():
     assert all(np.all(seed == index) for index, (_, seed) in enumerate(calls))
 
 
+def test_native_collision_integer_flags_select_passing_pose_rows():
+    torch = pytest.importorskip("torch")
+    from sim.isaac.tabletop_lightning_generate import native_collision_mask
+
+    flags = torch.tensor([0, 1, 0, 1], dtype=torch.int32)
+    assert torch.arange(4)[native_collision_mask(flags, 4)].tolist() == [1, 3]
+    with pytest.raises(ValueError, match="number of rows"):
+        native_collision_mask(flags, 5)
+
+
+def test_same_transform_different_native_joints_keep_their_parent_rows():
+    from sim.isaac.tabletop_lightning_yaw import distinct_pose_batches
+
+    a, b = np.eye(4), np.eye(4)
+    b[0, 3] = 0.02
+    rows = [(4, 10, a), (8, 10, a), (3, 10, b)]
+    groups = list(distinct_pose_batches(rows, 96))
+    assert [[r[0] for r in g] for g in groups] == [[4, 3], [8]]
+
+
 def test_yaw_reprojection_compares_native_inward_normal_to_scan_surface():
     from scipy.spatial.transform import Rotation
     from sim.isaac.tabletop_lightning_yaw import yaw_candidates

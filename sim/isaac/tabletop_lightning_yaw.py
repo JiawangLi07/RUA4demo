@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +14,7 @@ from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
 from .tabletop_lightning import central_palm_samples
-from .tabletop_lightning_generate import prepare
+from .tabletop_lightning_generate import native_collision_mask, prepare
 
 
 def yaw_candidates(mesh, seeds, palm_patch, step_deg):
@@ -76,6 +77,20 @@ def yaw_candidates(mesh, seeds, palm_patch, step_deg):
             )
 
 
+def distinct_pose_batches(rows, batch_size):
+    # Native IK filters rows and returns their unchanged object transforms.
+    # More than one native seed can share a transform but have different q.
+    # Separate those seeds so reverse lookup always identifies the actual parent.
+    groups = defaultdict(list)
+    for row in rows:
+        groups[row[2].tobytes()].append(row)
+    while groups:
+        distinct = [group.pop(0) for group in groups.values()]
+        groups = {key: group for key, group in groups.items() if group}
+        for i in range(0, len(distinct), batch_size):
+            yield distinct[i : i + batch_size]
+
+
 def solve(api, torch, ctx, mesh, seeds, proposals):
     from lygra.batch_grasp_optimizer import compute_wrench_score_vectorized
     from lygra.pipeline.module.collision import batch_filter_collision
@@ -90,8 +105,7 @@ def solve(api, torch, ctx, mesh, seeds, proposals):
     results, source_rows, angles = {}, [], []
     for width in range(2, 6):
         group = [p for p in proposals if len(p[3]) == width]
-        for off in range(0, len(group), 96):
-            chunk = group[off : off + 96]
+        for chunk in distinct_pose_batches(group, 96):
             ids, degrees, poses, pts, nrm, ppts, pnrm, palm_ok = map(
                 np.asarray, zip(*chunk)
             )
@@ -134,9 +148,10 @@ def solve(api, torch, ctx, mesh, seeds, proposals):
             )
             if result is None or not len(result["q"]):
                 continue
-            clear = batch_filter_collision(
+            flags = batch_filter_collision(
                 tree, result["q"], result["object_pose"], check_points, pairs, hand_mesh
             )
+            clear = native_collision_mask(flags, len(result["q"]))
             src = {
                 p.tobytes(): (int(i), int(deg))
                 for p, i, deg in zip(poses, ids, degrees)
