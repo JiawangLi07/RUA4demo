@@ -344,7 +344,7 @@ class LightningBank:
                 for seed in ik_seeds:
                     try:
                         solved = ctrl.ik.solve(pre, seed)
-                        ctrl.lift_ik(palm, solved)
+                        ctrl.lightning_lift_ik(palm, solved)
                         break
                     except NoPath:
                         solved = None

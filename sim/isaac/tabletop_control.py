@@ -360,6 +360,7 @@ class Controller:
         transit=False,
         protected=None,
         object_margin=0.0025,
+        endpoint_check=None,
     ):
         start = self.io.fk(PALM)
         initial = self.arm.copy()
@@ -468,6 +469,8 @@ class Controller:
 
         try:
             joints = path(anchors)
+            if endpoint_check is not None:
+                endpoint_check(joints[-1])
             if transit and not swept_clear(joints, free):
                 raise NoPath("object in observation or approach path")
         except NoPath:
@@ -486,6 +489,15 @@ class Controller:
                         endpoints.append(q)
                 except NoPath:
                     continue
+            if endpoint_check is not None:
+                valid = []
+                for q in endpoints:
+                    try:
+                        endpoint_check(q)
+                        valid.append(q)
+                    except NoPath:
+                        continue
+                endpoints = valid
             lifted = []
             for anchor in (start, goal):
                 qlist = []
@@ -589,6 +601,10 @@ class Controller:
         grasp = self.ik.solve(palm, pre_joints)
         probe = self.ik.solve(shifted(palm, [0, 0, 0.022]), grasp)
         self.ik.solve(shifted(palm, [0, 0, self.lift_travel]), probe)
+
+    def lightning_lift_ik(self, palm, pre_joints):
+        seat = self.ik.solve(shifted(palm, -0.009 * palm[:3, 0]), pre_joints)
+        self.lift_ik(palm, seat)
 
     def coarse_surface(self, name, observed):
         from .head_wrist_surface import RegisteredSurface
@@ -1063,11 +1079,24 @@ class Controller:
         if not self.clear(pre, qo, others) or not self.clear(grasp, qt, others):
             raise NoPath("wrist refinement invalidated clearance")
         self.event("approach", posture=seed["posture"])
-        self.move(pre, qo, 0.58, others, True, surface, object_margin=0.0005)
+        endpoint_check = (
+            (lambda arm: self.lightning_lift_ik(grasp, arm))
+            if seed["origin"] == "lightning_grasp"
+            else None
+        )
+        self.move(
+            pre,
+            qo,
+            0.58,
+            others,
+            True,
+            surface,
+            object_margin=0.0005,
+            endpoint_check=endpoint_check,
+        )
         if seed["origin"] == "lightning_grasp":
             try:
-                seated = self.ik.solve(shifted(grasp, -0.009 * grasp[:3, 0]), self.arm)
-                self.lift_ik(grasp, seated)
+                self.lightning_lift_ik(grasp, self.arm)
             except NoPath:
                 delta = pre[:3, 3] - grasp[:3, 3]
                 delta = 0.035 * delta / max(np.linalg.norm(delta), 1e-6)

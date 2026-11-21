@@ -149,6 +149,23 @@ def test_static_palm_contact_joins_native_contact_search_in_object_frame():
     assert np.allclose(out["extra_contact_normal"], -obj_out)
 
 
+def test_lightning_lift_uses_actual_seating_branch():
+    c = Controller.__new__(Controller)
+    c.lift_travel = 0.067
+    calls = []
+
+    def solve(pose, seed):
+        calls.append((pose[:3, 3].copy(), seed.copy()))
+        return seed + 1
+
+    c.ik = SimpleNamespace(solve=solve)
+    c.lightning_lift_ik(np.eye(4), np.zeros(7))
+    assert np.allclose(
+        [p for p, _ in calls], [[-0.009, 0, 0], [0, 0, 0], [0, 0, 0.022], [0, 0, 0.067]]
+    )
+    assert all(np.all(seed == index) for index, (_, seed) in enumerate(calls))
+
+
 def test_yaw_reprojection_compares_native_inward_normal_to_scan_surface():
     from scipy.spatial.transform import Rotation
     from sim.isaac.tabletop_lightning_yaw import yaw_candidates
