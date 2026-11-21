@@ -1,0 +1,4 @@
+{
+  "schema": "dexbridge.artifact-policy.v1",
+  "cache_dir": "build/dexonomy/artifacts"
+}

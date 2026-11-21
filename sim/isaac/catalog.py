@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import os
+from importlib import import_module
 from pathlib import Path
 from time import perf_counter
 
@@ -16,12 +17,20 @@ from .scene_fixture import rigid_transform
 from .scene_meshes import load_mesh_bundle
 
 DIGITS = ("index", "middle", "ring", "pinky")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BUNDLED_INDEX = REPO_ROOT / "DexBridge/configs/skills/sharpa_grasp_templates.json"
+# A standalone sim deployment may still supply the full DexBridge package via PYTHONPATH.
+GRASP_PACKAGE = (
+    "DexBridge.src.dexbridge.skills.grasp"
+    if (REPO_ROOT / "DexBridge/src/dexbridge/skills/grasp").is_dir()
+    else "dexbridge.skills.grasp"
+)
 
 
 def mesh_features(vertices, faces):
     """Use the same PCA sign, face sampling and silhouette convention as the source catalog."""
-    from dexbridge.skills.grasp.shapes import fit_surface_primitives
-    from dexbridge.skills.grasp.silhouette import silhouette_features
+    shapes = import_module(f"{GRASP_PACKAGE}.shapes")
+    silhouette = import_module(f"{GRASP_PACKAGE}.silhouette")
 
     mean = vertices.mean(axis=0)
     axes = np.linalg.svd(vertices - mean, full_matrices=False)[2].T
@@ -37,8 +46,8 @@ def mesh_features(vertices, faces):
     return {
         "T_obj_bbox": box,
         "bbox_dims": dims,
-        **fit_surface_primitives(vertices, faces, dims, box),
-        "silhouette_features": silhouette_features(vertices, faces, dims, box),
+        **shapes.fit_surface_primitives(vertices, faces, dims, box),
+        "silhouette_features": silhouette.silhouette_features(vertices, faces, dims, box),
     }
 
 
@@ -51,14 +60,14 @@ def palm_contacts(card):
 
 def select(templates, features, world_from_mesh, goal):
     """Rank every type, then transfer size/support-compatible modes into the current world frame."""
-    from dexbridge.skills.grasp.postures import choose_plan, rank_types
+    postures = import_module(f"{GRASP_PACKAGE}.postures")
 
     if goal not in ("palm_wrap", "any"):
         raise ValueError("expected palm_wrap or any")
     if list(templates["joint_names"]) != RIGHT_JOINTS:
         raise ValueError("catalog joint order differs from the Sharpa SDK order")
     world = rigid_transform(world_from_mesh)
-    ranks = rank_types(templates, features)
+    ranks = postures.rank_types(templates, features)
     candidates, rejected = [], {}
     for rank, item in enumerate(ranks):
         name = item["grasp_type"]
@@ -68,7 +77,7 @@ def select(templates, features, world_from_mesh, goal):
             rejected[name] = "template lacks the requested palm and proximal finger contacts"
             continue
         try:
-            plan = choose_plan(templates, name, features, world)
+            plan = postures.choose_plan(templates, name, features, world)
         except ValueError as exc:
             if str(exc) != "no shape/support-compatible upper-hemisphere train mode":
                 raise
@@ -192,12 +201,13 @@ def observe(bundle, files, table_z):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--index", type=Path, required=True, help="DexBridge v3 catalog with its numerical cache"
+        "--index", type=Path, default=BUNDLED_INDEX, help="DexBridge v3 index (default: bundled catalog)"
     )
-    parser.add_argument("--assets", type=Path, help="station assets for --case or --config")
+    parser.add_argument("--assets", type=Path, help="asset root for a station case or a metric shape prior")
     case = parser.add_mutually_exclusive_group(required=True)
     case.add_argument("--config", type=Path)
     case.add_argument("--case", choices=CASES)
+    case.add_argument("--prior", choices=CASES, help="query only the metric shape prior for a named case")
     case.add_argument("--mesh", type=Path, help="standalone object mesh (e.g. a SAM3D GLB)")
     parser.add_argument("--meters-per-unit", type=float, help="physical scale of the standalone mesh")
     obs = parser.add_mutually_exclusive_group(required=True)
@@ -205,10 +215,12 @@ def main():
     obs.add_argument("--world-from-mesh", type=Path, help="registered metric mesh pose as a JSON 4x4 matrix")
     parser.add_argument("--wrist-mesh", type=Path, help="optional subsequent D405 observation")
     parser.add_argument("--table-z", type=float, help="measured horizontal support height in metres")
-    parser.add_argument("--goal", choices=("any", "palm_wrap"), default="palm_wrap")
+    parser.add_argument("--goal", choices=("any", "palm_wrap"), help="default: any for --prior, palm_wrap otherwise")
     parser.add_argument("--shortlist", type=int, default=3, choices=range(1, 9))
     parser.add_argument("--out", type=Path, required=True, help="new output directory")
     args = parser.parse_args()
+    if args.goal is None:
+        args.goal = "any" if args.prior else "palm_wrap"
     if args.head_mesh and (args.table_z is None or not np.isfinite(args.table_z)):
         parser.error("--head-mesh requires a finite --table-z")
     if args.wrist_mesh and not args.head_mesh:
@@ -218,12 +230,14 @@ def main():
             parser.error("--mesh requires the registered --world-from-mesh pose")
         if args.meters_per_unit is None or not np.isfinite(args.meters_per_unit) or args.meters_per_unit <= 0:
             parser.error("--mesh requires a positive --meters-per-unit (use 1 for metric vertices)")
-    elif not args.assets or args.meters_per_unit is not None:
-        parser.error("--case and --config require --assets and use the asset's metric scale")
-    from dexbridge.skills.grasp.templates import load_templates
+    elif args.meters_per_unit is not None:
+        parser.error("--meters-per-unit applies to --mesh; prepared priors use metres")
+    elif not args.prior and not args.assets:
+        parser.error("--case and --config require --assets")
+    template_io = import_module(f"{GRASP_PACKAGE}.templates")
 
     start = perf_counter()
-    templates = load_templates(args.index)
+    templates = template_io.load_templates(args.index)
     config = None
     if args.mesh:
         import trimesh
@@ -233,9 +247,14 @@ def main():
             raise ValueError("expected a nonempty finite triangle mesh")
         vertices, faces = np.asarray(mesh.vertices) * args.meters_per_unit, np.asarray(mesh.faces)
     else:
-        os.environ["RUA_SIM_ASSETS"] = str(args.assets.resolve())
-        config = load_case(args.config, args.case)
-        bundle = load_mesh_bundle(config["head_wrist_validation"]["metric_shape_prior"])
+        if args.prior:
+            objects = json.loads((Path(__file__).with_name("config") / "objects.json").read_bytes())
+            prior = objects[args.prior]["head_wrist_validation"]["metric_shape_prior"]
+        else:
+            os.environ["RUA_SIM_ASSETS"] = str(args.assets.resolve())
+            config = load_case(args.config, args.case)
+            prior = config["head_wrist_validation"]["metric_shape_prior"]
+        bundle = load_mesh_bundle(prior, assets=args.assets or REPO_ROOT)
         vertices, faces, _ = bundle["visual"]
     features = mesh_features(vertices, faces)
     prepared = perf_counter()
@@ -254,6 +273,8 @@ def main():
     result["registration"] = fits
     if args.mesh:
         result["mesh"] = {"file": args.mesh.name, "meters_per_unit": args.meters_per_unit}
+    elif args.prior:
+        result["mesh"] = {**prior, "meters_per_unit": 1.0}
     native = None
     # The palm controller fits cylindrical sides; opposed contacts use their own surface fit.
     cyl = result["shape"] in ("slender_cylinder", "stout_cylinder")

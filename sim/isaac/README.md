@@ -13,7 +13,7 @@
 
 实测环境为 Isaac Sim 5.1、Isaac Lab 0.53.1、NVIDIA CUDA，物理频率 240 Hz，录像 15 fps。使用带有 Isaac Lab、NumPy、SciPy 和 Pillow 的运行时 Python。编码 MP4 需要系统命令 `ffmpeg`。以下命令从 RUA4demo 仓库根目录运行。
 
-场景、机械手 CAD、手形库和输入网格由工位部署提供。仿真使用当前帧的原生 RGB-D 和实例掩膜，将米制 SAM3D 先验配准到观测。相机内参和手眼关系从载入的 USD 场景读取。外部输入目录结构如下。
+完整仿真使用部署工位的场景、机械手 CAD、启动手形和物体刚体网格。仿真使用当前帧的原生 RGB-D 和实例掩膜，将米制 SAM3D 先验配准到观测。相机内参和手眼关系从载入的 USD 场景读取。外部输入目录结构如下。
 
 ```text
 $RUA_SIM_ASSETS/
@@ -40,14 +40,14 @@ python -m sim.isaac.score runs/isaac-screwdriver-01
 
 ## 用 36 类手形生成候选姿态
 
-可选模块 `sim.isaac.catalog` 使用工位的 DexBridge v3 手形库。它按米制网格的截面、三轴尺寸和桌面朝向查询 33 类编号手形及 3 类扩展手形。每个匹配模式输出预抓、闭合、收紧三组 `T_world_palm` 与 SDK 顺序的 22 维绝对关节角（弧度）。输出同时保留模式编号、样本来源及尺寸是否超出插值范围。
+`sim.isaac.catalog` 默认使用仓库自带的 DexBridge v3 手形库。它按米制网格的截面、三轴尺寸和桌面朝向查询 33 类编号手形及 3 类扩展手形。每个匹配模式输出预抓、闭合、收紧三组 `T_world_palm` 与 SDK 顺序的 22 维绝对关节角（弧度）。输出同时保留模式编号、样本来源及尺寸是否超出插值范围。
 
-`--goal palm_wrap` 要求模板包含中央掌面及至少两根手指的近节或中节，按多指包络的覆盖及该形状的历史记录排序。`--goal any` 可查询其他接触目标的通用候选。需将 DexBridge 的 `src` 加入 Python 搜索路径，并备好与索引匹配的数值缓存。以下示例从已有的一帧头部网格开始。
+`--goal palm_wrap` 要求模板包含中央掌面及至少两根手指的近节或中节，按多指包络的覆盖及该形状的历史记录排序。`--goal any` 可查询其他接触目标的通用候选。横放羽毛球可直接使用 `--prior shuttle` 在 CPU 上复算。仓库内附两帧样例、索引和全部配套缓存。[羽毛球示例与文件清单](../../DexBridge/README.md)
+
+下面从工位回合的一帧头部网格生成球筒候选和可执行的场景配置。
 
 ```bash
-export PYTHONPATH="$DEXBRIDGE_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 python -m sim.isaac.catalog --assets "$RUA_SIM_ASSETS" --case tube \
-  --index "$DEXBRIDGE_ROOT/configs/skills/sharpa_grasp_templates.json" \
   --head-mesh "$EPISODE/attempt_01/head_mesh.npz" --table-z "$TABLE_Z_METRES" \
   --goal palm_wrap --shortlist 3 --out runs/tube-catalog
 ```
@@ -57,7 +57,7 @@ python -m sim.isaac.catalog --assets "$RUA_SIM_ASSETS" --case tube \
 手头只有 SAM3D 的 GLB 时，可用 Trimesh 直接读取原网格。提供每个模型单位对应多少米，以及缩放后的模型坐标到世界坐标的刚体变换。以下命令仅计算候选抓姿，可以在没有 Isaac Sim 的机器上运行。
 
 ```bash
-python -m sim.isaac.catalog --index "$DEXBRIDGE_ROOT/configs/skills/sharpa_grasp_templates.json" \
+python -m sim.isaac.catalog \
   --mesh bottle.glb --meters-per-unit "$METERS_PER_UNIT" --world-from-mesh pose.json \
   --goal palm_wrap --out runs/bottle-from-glb
 ```

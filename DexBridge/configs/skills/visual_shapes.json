@@ -1,0 +1,41 @@
+{
+  "schema": "dexbridge.visual-shapes.v3",
+  "primitive_gating": "qualified_fit",
+  "size_measure": "grasp_span",
+  "thresholds": {
+    "small_max_extent_m": 0.04,
+    "medium_max_extent_m": 0.12,
+    "slender_long_middle_ratio": 2.5,
+    "flat_middle_short_ratio": 3.0,
+    "round_cross_section_ratio": 1.35,
+    "sphere_long_short_ratio": 1.3,
+    "max_fit_rmse_over_short_extent": 0.16,
+    "ellipsoid_max_rmse_over_short_extent": 0.12,
+    "ellipsoid_long_short_ratio": 3.0,
+    "round_max_bbox_fill_fraction": 0.88,
+    "round_min_central_symmetry_iou": 0.80,
+    "round_min_solidity": 0.90,
+    "visible_hole_min_area_fraction": 0.02,
+    "visible_hole_min_diameter_ratio": 0.12,
+    "concave_max_solidity": 0.75
+  },
+  "classification_priority_zh": [
+    "显式视觉shape_key优先；自动GT先查三个正交投影是否有足够大的可见封闭孔。孔不等于可穿指把手，也不授权插入动作。",
+    "分别检查球/圆柱/椭球的尺寸比例和误差资格，再与盒拟合按RMSE、英文名排序；有投影证据时，曲线截面须凸、近中心对称，且不可几乎填满矩形bbox。圆柱查轴向截面，球/椭球查三视图，避免圆角盒与截断杯体仅因低RMSE混入。",
+    "优先采用选中的球/圆柱/椭球；其余先薄片再盒，仍无合格拟合时用细长比例或明显轮廓凹缺区分非标准外形。仍缺证据才unknown。",
+    "小件不再冒充形状类：尺寸键用抓取跨距min(PCA前两边)，≤0.04m为small、≤0.12m为medium，其余large；同时保留最长边与厚度。"
+  ],
+  "surface_fit_zh": "2048个seed=20261117面积均匀三角样本。额外椭球为bbox中心和半轴的径向表面误差；投影以填充三角面而非顶点凸包测孔和凹缺。阈值只由train内部开发选择。",
+  "hints_zh": {
+    "slender_cylinder": "细长圆柱：图像有连续圆柱侧壁，深度截面近圆；轴长/直径≥2.5。仅长条轮廓不能证明是圆柱。",
+    "stout_cylinder": "短粗圆柱/圆盘：近圆截面和圆柱侧壁可辨，轴长/直径<2.5；薄圆盘的轴是厚度方向。",
+    "flat_plate": "薄板/薄片：侧视深度显示中边/厚度≥3；不凭正面面积猜厚度。合格圆柱圆盘优先归圆柱。",
+    "box": "方块/棱柱：多视角可见平面和棱边，深度大部分表面接近包围盒平面；允许适度倒角/局部细节。",
+    "sphere": "近球形：多视角曲面近球，三边尺度接近（最长/最短≤1.3）；单个圆轮廓不够。",
+    "rounded": "椭圆/卵形：多视角是连续凸曲面，长度可超过宽度，bbox椭球径向误差小；不能仅凭圆角类别名认定。",
+    "elongated": "非圆细长体：最长/中边≥2.5，但圆柱拟合不合格，如长棱柱或有局部突起的细长体；观察截面与端部。",
+    "handle_ring": "带孔/环/把手：至少一个多视角轮廓有可见封闭孔，孔面积与宽度足够；遮挡边界、开口凹槽不算孔，孔宽另行量测，不能直接假设可穿指。",
+    "concave": "明显凹缺/多突起体：某视角轮廓占凸包面积≤75%，有明显凹口或伸出部分；非一般圆角块体。",
+    "unknown": "上述形状证据都不足：补充视角/深度；不使用DGN类别名补判，也不把unknown改名来虚增覆盖。"
+  }
+}

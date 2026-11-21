@@ -41,7 +41,7 @@ def _mesh(vertices, faces):
     return vertices, faces.astype(np.int32)
 
 
-def load_mesh_bundle(spec):
+def load_mesh_bundle(spec, *, assets=None):
     """Read prepared metre-space arrays; callers must retain source attribution.
 
     NPZ keys: visual_vertices, visual_faces, visual_colors, collision_count, and
@@ -60,7 +60,7 @@ def load_mesh_bundle(spec):
         or not relative.parts
     ):
         raise ValueError("mesh bundle must be relative to one third-party source")
-    root = asset_path(source).resolve()
+    root = asset_path(source, base=assets).resolve()
     path = root.joinpath(*relative.parts).resolve()
     if not path.is_relative_to(root):
         raise ValueError("mesh bundle escapes its third-party source")

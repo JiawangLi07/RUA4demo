@@ -92,7 +92,7 @@ def test_scoring_requires_palm_contact_at_every_hold_step(tmp_path):
 
 
 def test_registered_world_frame_and_all_joint_stages(monkeypatch):
-    source = pytest.importorskip("dexbridge.skills.grasp.postures")
+    source = pytest.importorskip(f"{catalog.GRASP_PACKAGE}.postures")
     ranked = [
         {"grasp_type": "tip", "shape_features": {"shape_key": "stout_cylinder"}},
         {"grasp_type": "palm", "shape_features": {"shape_key": "stout_cylinder"}},
@@ -134,7 +134,7 @@ def test_registered_world_frame_and_all_joint_stages(monkeypatch):
 
 def test_standalone_glb_uses_metric_scale_and_world_pose(tmp_path, monkeypatch):
     trimesh = pytest.importorskip("trimesh")
-    source = pytest.importorskip("dexbridge.skills.grasp.templates")
+    source = pytest.importorskip(f"{catalog.GRASP_PACKAGE}.templates")
     mesh = tmp_path / "box.glb"
     trimesh.creation.box(extents=(2, 3, 4)).export(mesh)
     world = np.eye(4)
@@ -169,4 +169,43 @@ def test_standalone_glb_uses_metric_scale_and_world_pose(tmp_path, monkeypatch):
     )
     assert catalog.main() == 0
     assert json.loads((out / "candidates.json").read_bytes())["mesh"]["meters_per_unit"] == 0.01
+    assert not (out / "case.json").exists()
+
+
+def test_bundled_catalog_references_every_cached_component():
+    import hashlib
+
+    index = json.loads(catalog.BUNDLED_INDEX.read_bytes())
+    cards = index["types"]
+    refs = [card["modes_file"] for card in cards.values()]
+    refs.extend((index["selection_file"], index["visual_shape_evidence_file"]))
+    assert len(cards) == 36
+    assert len({ref["sha256"] for ref in refs}) == 38
+    for ref in refs:
+        payload = (catalog.BUNDLED_INDEX.parents[2] / ref["cache_path"]).read_bytes()
+        assert len(payload) == ref["size_bytes"]
+        assert hashlib.sha256(payload).hexdigest() == ref["sha256"]
+
+
+def test_shuttle_example_registers_both_views_without_station_assets(tmp_path, monkeypatch):
+    example = catalog.REPO_ROOT / "sim/isaac/examples/shuttle"
+    out = tmp_path / "selection"
+    monkeypatch.delenv("RUA_SIM_ASSETS", raising=False)
+    monkeypatch.setattr(sys, "argv", [
+        "catalog", "--prior", "shuttle", "--head-mesh", str(example / "head_mesh.npz"),
+        "--wrist-mesh", str(example / "wrist_mesh.npz"), "--table-z", "0.7165", "--out", str(out),
+    ])
+    assert catalog.main() == 0
+    selection = json.loads((out / "candidates.json").read_bytes())
+    assert selection["types_inspected"] == 36 and len(selection["candidates"]) == 22
+    assert selection["mesh"]["file"] == "shuttle_side_prior.npz"
+    assert len(selection["registration"]) == 2
+    assert selection["joint_names"] == RIGHT_JOINTS
+    for candidate in selection["candidates"]:
+        for stage in ("pregrasp", "grasp", "squeeze"):
+            pose, angles = (np.asarray(candidate[stage][field]) for field in ("T_world_palm", "q_rad"))
+            assert pose.shape == (4, 4) and angles.shape == (22,)
+            assert np.isfinite(pose).all() and np.isfinite(angles).all()
+            np.testing.assert_allclose(pose[:3, :3].T @ pose[:3, :3], np.eye(3), atol=1e-6)
+            np.testing.assert_allclose(pose[3], [0, 0, 0, 1])
     assert not (out / "case.json").exists()

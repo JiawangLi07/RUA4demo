@@ -1,4 +1,4 @@
-"""Station assets are supplied by the operator and kept outside the checkout."""
+"""Resolve a station or bundled asset relative to its source directory."""
 
 import os
 from pathlib import Path
@@ -29,10 +29,11 @@ RIGHT_JOINTS = [
 ]
 
 
-def asset_path(source, *parts):
+def asset_path(source, *parts, base=None):
     if not source or Path(source).parts != (source,) or source == "..":
         raise ValueError(f"invalid asset source {source!r}")
-    base = os.environ.get("RUA_SIM_ASSETS")
+    if base is None:
+        base = os.environ.get("RUA_SIM_ASSETS")
     if not base:
         raise ValueError("pass --assets or set RUA_SIM_ASSETS to the station asset directory")
     root = (Path(base) / source).resolve()
