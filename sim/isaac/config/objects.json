@@ -1,0 +1,307 @@
+{
+  "bottle": {
+    "settling": {
+      "physics_dt": 0.004166666666666667,
+      "minimum_seconds": 0.5,
+      "maximum_seconds": 2.0,
+      "window_seconds": 0.2,
+      "maximum_linear_speed_m_s": 0.005,
+      "maximum_angular_speed_rad_s": 0.05,
+      "maximum_hand_table_penetration_m": 0.001
+    },
+    "assignment": {
+      "left": "sam3d_bottle_right",
+      "right": "sam3d_bottle_right"
+    },
+    "object_prims": {
+      "sam3d_bottle_right": "/World/SkillObjects/sam3d_bottle_right"
+    },
+    "added_objects": [
+      {
+        "name": "sam3d_bottle_right",
+        "kind": "mesh",
+        "mesh": {
+          "source": "sam3d_glb",
+          "file": "bottle.npz",
+          "sha256": "4717ec7b93c2d741beba5996b47792ea3cff870230a9cac6208633283d06f754"
+        },
+        "mass_kg": 0.1,
+        "prim_path": "/World/SkillObjects/sam3d_bottle_right",
+        "position": [
+          0.665,
+          -0.2,
+          0.8125
+        ],
+        "quaternion_wxyz": [
+          1,
+          0,
+          0,
+          0
+        ],
+        "friction": {
+          "static": 0.6,
+          "dynamic": 0.6,
+          "restitution": 0
+        }
+      }
+    ],
+    "head_wrist_validation": {
+      "object_label": "bottle / palm seating",
+      "metric_shape_prior": {
+        "source": "sam3d_glb",
+        "file": "bottle.npz",
+        "sha256": "4717ec7b93c2d741beba5996b47792ea3cff870230a9cac6208633283d06f754"
+      },
+      "max_grasp_attempts": 2,
+      "whole_palm": true,
+      "tactile_seating": true,
+      "roll_on_fingers": true,
+      "wrap_roll_deg": 17,
+      "wrap_cant_deg": 17,
+      "fit_finite_surface": true,
+      "probe_supported_wrap": true,
+      "regulate_power_lift": true,
+      "cradle_lift_deg": 0,
+      "share_palm_load": true
+    }
+  },
+  "tube": {
+    "settling": {
+      "physics_dt": 0.004166666666666667,
+      "minimum_seconds": 0.5,
+      "maximum_seconds": 2.0,
+      "window_seconds": 0.2,
+      "maximum_linear_speed_m_s": 0.005,
+      "maximum_angular_speed_rad_s": 0.05,
+      "maximum_hand_table_penetration_m": 0.001
+    },
+    "assignment": {
+      "right": "sam3d_tube",
+      "left": "sam3d_tube"
+    },
+    "object_prims": {
+      "sam3d_tube": "/World/SkillObjects/sam3d_tube"
+    },
+    "added_objects": [
+      {
+        "name": "sam3d_tube",
+        "kind": "mesh",
+        "mesh": {
+          "source": "sam3d_glb",
+          "file": "tube.npz",
+          "sha256": "f43362506cb4738f1257f9ebd6e17bc09932ee2459f0a9cb395aab42cd0c4652"
+        },
+        "mass_kg": 0.07,
+        "prim_path": "/World/SkillObjects/sam3d_tube",
+        "position": [
+          0.662,
+          -0.212,
+          0.8125
+        ],
+        "quaternion_wxyz": [
+          1,
+          0,
+          0,
+          0
+        ],
+        "friction": {
+          "static": 0.6,
+          "dynamic": 0.6,
+          "restitution": 0
+        }
+      }
+    ],
+    "head_wrist_validation": {
+      "object_label": "tube / palm seating",
+      "metric_shape_prior": {
+        "source": "sam3d_glb",
+        "file": "tube.npz",
+        "sha256": "f43362506cb4738f1257f9ebd6e17bc09932ee2459f0a9cb395aab42cd0c4652"
+      },
+      "max_grasp_attempts": 3,
+      "whole_palm": true,
+      "tactile_seating": true,
+      "roll_on_fingers": true,
+      "wrap_roll_deg": 15,
+      "wrap_cant_deg": 22
+    }
+  },
+  "shuttle": {
+    "settling": {
+      "physics_dt": 0.004166666666666667,
+      "minimum_seconds": 0.5,
+      "maximum_seconds": 4.0,
+      "window_seconds": 0.2,
+      "maximum_linear_speed_m_s": 0.005,
+      "maximum_angular_speed_rad_s": 0.05,
+      "maximum_hand_table_penetration_m": 0.001
+    },
+    "assignment": {
+      "right": "sam3d_shuttle",
+      "left": "sam3d_shuttle"
+    },
+    "object_prims": {
+      "sam3d_shuttle": "/World/SkillObjects/sam3d_shuttle"
+    },
+    "added_objects": [
+      {
+        "name": "sam3d_shuttle",
+        "kind": "mesh",
+        "mesh": {
+          "source": "sam3d_glb",
+          "file": "shuttle.npz",
+          "sha256": "15acd438cf437d8a07fb55f7fb234e2922c790ae6dfa836f4cc913fe9a31655c"
+        },
+        "mass_kg": 0.005,
+        "prim_path": "/World/SkillObjects/sam3d_shuttle",
+        "position": [
+          0.662,
+          -0.212,
+          0.734058791346848
+        ],
+        "quaternion_wxyz": [
+          0.019424883132432947,
+          0.7712646906114105,
+          0.023564267532809748,
+          0.6357815475672591
+        ],
+        "friction": {
+          "static": 0.6,
+          "dynamic": 0.6,
+          "restitution": 0
+        }
+      }
+    ],
+    "head_wrist_validation": {
+      "object_label": "shuttle",
+      "metric_shape_prior": {
+        "source": "sam3d_glb",
+        "file": "shuttle_side_prior.npz",
+        "sha256": "df92cba6b33463ece2a305a8a8d520c5f48cf1d0de6cc910a4ef671c33a435d0"
+      },
+      "max_grasp_attempts": 3,
+      "whole_palm": false,
+      "side_lying_taper": true
+    }
+  },
+  "box": {
+    "settling": {
+      "physics_dt": 0.004166666666666667,
+      "minimum_seconds": 0.5,
+      "maximum_seconds": 2.0,
+      "window_seconds": 0.2,
+      "maximum_linear_speed_m_s": 0.005,
+      "maximum_angular_speed_rad_s": 0.05,
+      "maximum_hand_table_penetration_m": 0.001
+    },
+    "assignment": {
+      "right": "sam3d_box",
+      "left": "sam3d_box"
+    },
+    "object_prims": {
+      "sam3d_box": "/World/SkillObjects/sam3d_box"
+    },
+    "added_objects": [
+      {
+        "name": "sam3d_box",
+        "kind": "mesh",
+        "mesh": {
+          "source": "sam3d_glb",
+          "file": "box.npz",
+          "sha256": "bf1ca4ddd5521157a18de5db0cb9084b936e38ac97858b992042b31b07b38397"
+        },
+        "mass_kg": 0.075,
+        "prim_path": "/World/SkillObjects/sam3d_box",
+        "position": [
+          0.662,
+          -0.212,
+          0.7277026695293061
+        ],
+        "quaternion_wxyz": [
+          1,
+          0,
+          0,
+          0
+        ],
+        "friction": {
+          "static": 0.6,
+          "dynamic": 0.6,
+          "restitution": 0
+        }
+      }
+    ],
+    "head_wrist_validation": {
+      "metric_shape_prior": {
+        "source": "sam3d_glb",
+        "file": "box.npz",
+        "sha256": "bf1ca4ddd5521157a18de5db0cb9084b936e38ac97858b992042b31b07b38397"
+      },
+      "object_label": "box",
+      "max_grasp_attempts": 3,
+      "gesture_order": [
+        "22_Parallel_Extension",
+        "1_Large_Diameter",
+        "24_Tip_Pinch"
+      ],
+      "whole_palm": false
+    }
+  },
+  "screwdriver": {
+    "settling": {
+      "physics_dt": 0.004166666666666667,
+      "minimum_seconds": 0.5,
+      "maximum_seconds": 2.0,
+      "window_seconds": 0.2,
+      "maximum_linear_speed_m_s": 0.005,
+      "maximum_angular_speed_rad_s": 0.05,
+      "maximum_hand_table_penetration_m": 0.001
+    },
+    "assignment": {
+      "right": "sam3d_driver",
+      "left": "sam3d_driver"
+    },
+    "object_prims": {
+      "sam3d_driver": "/World/SkillObjects/sam3d_driver"
+    },
+    "added_objects": [
+      {
+        "name": "sam3d_driver",
+        "kind": "mesh",
+        "mesh": {
+          "source": "sam3d_glb",
+          "file": "driver.npz",
+          "sha256": "69c0b1222c5c45839cc31551a66d669d5b8540a3a252b23a730253aaa8711750"
+        },
+        "mass_kg": 0.1,
+        "prim_path": "/World/SkillObjects/sam3d_driver",
+        "position": [
+          0.662,
+          -0.212,
+          0.74043664306723
+        ],
+        "quaternion_wxyz": [
+          1,
+          0,
+          0,
+          0
+        ],
+        "friction": {
+          "static": 0.6,
+          "dynamic": 0.6,
+          "restitution": 0
+        }
+      }
+    ],
+    "head_wrist_validation": {
+      "metric_shape_prior": {
+        "source": "sam3d_glb",
+        "file": "driver.npz",
+        "sha256": "69c0b1222c5c45839cc31551a66d669d5b8540a3a252b23a730253aaa8711750"
+      },
+      "object_label": "driver",
+      "max_grasp_attempts": 3,
+      "whole_palm": false,
+      "multi_finger_handle": true
+    }
+  }
+}

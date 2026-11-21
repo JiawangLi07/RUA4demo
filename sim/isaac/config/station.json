@@ -1,0 +1,49 @@
+{
+  "source_name": "real2sim_0417",
+  "scene_file": "source/scene.usdc",
+  "metadata_directory": "source",
+  "robot_prim": "/World/Robot",
+  "table_prim": "/World/Table",
+  "camera_prim": "/World/main_camera",
+  "arm_stiffness": 4000.0,
+  "arm_damping": 80.0,
+  "physics_dt": 0.004166666666666667,
+  "maximum_solver_iterations": 255,
+  "minimum_contact_force_N": 0.01,
+  "images": {
+    "width": 640,
+    "height": 480,
+    "fps": 15,
+    "observer": {
+      "position_m": [
+        1.05,
+        -0.53,
+        0.94
+      ],
+      "rotation_wxyz_ros": [
+        -0.541781340517172,
+        0.6932518979280631,
+        0.37447198827581146,
+        -0.29265255010560726
+      ]
+    }
+  },
+  "removed_source_objects": [
+    {
+      "name": "Tube",
+      "prim_path": "/World/Environment/Tube"
+    },
+    {
+      "name": "Shuttle",
+      "prim_path": "/World/Environment/Shuttle"
+    }
+  ],
+  "head_wrist_validation": {
+    "nominal_radius_m": 0.033,
+    "camera_prim": "/World/Robot/TCP_Link_R/wrist_camera",
+    "use_wrist": true,
+    "shape_model": "local_band",
+    "direct_pregrasp": true,
+    "record_link_forces": true
+  }
+}
