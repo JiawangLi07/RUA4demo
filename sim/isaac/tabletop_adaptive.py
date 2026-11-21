@@ -173,33 +173,56 @@ def wall_grasps(ctrl, surface):
     radius = round(float(np.mean(xy_hi - xy_lo) * 0.5), 3)
     if radius < 0.004:
         return
+    # A tapered wall changes width across the finger span. Fit its local section
+    # at each candidate height, retaining the broad waist estimate at the centre.
+    upper = points[np.abs(points[:, 2] - (lo + 0.74 * (hi - lo))) < 0.007]
+    tapered = False
+    if len(upper) >= 16:
+        limits = np.quantile(upper[:, :2], [0.01, 0.99], axis=0)
+        tapered = 0.5 * np.mean(limits[1] - limits[0]) < 0.9 * radius
+    levels = (
+        (0.49, 0.58, 0.40)
+        if not tapered
+        else (0.49, 0.46, 0.52, 0.43, 0.55, 0.40, 0.58)
+    )
+    sections = []
+    for level in levels:
+        local_radius, local_center = radius, center
+        height = lo + level * (hi - lo)
+        span = points[np.abs(points[:, 2] - height) < 0.007]
+        if tapered and len(span) >= 16:
+            bounds = np.quantile(span[:, :2], [0.01, 0.99], axis=0)
+            measured = 0.5 * np.mean(bounds[1] - bounds[0])
+            if abs(measured - radius) > 0.0012:
+                local_radius = round(float(measured), 3)
+                local_center = bounds.mean(0)
+        sections.append((level, height, local_radius, local_center))
     park = ctrl.ik.fk(ctrl.reference_arm)
     for cant, roll, station in (
         (20, 15, 0.068),
         (10, 8, 0.063),
         (25, 20, 0.075),
     ):
-        key = (radius, cant, roll, station)
-        if key not in ctrl.wrap_cache:
-            ctrl.wrap_cache[key] = wall_fit(ctrl, *key)
-        axes, (cx, cz), opened, closed, tight = ctrl.wrap_cache[key]
-        shapes = ctrl.link_shapes(closed)
-        finger_height = [
-            (axes @ shapes[f"right_{d}_elastomer"].mean(0))[1] for d in DIGITS
-        ]
-        thumb_height = float(finger_height[0] - np.mean(finger_height[1:]))
-        for yaw in range(-165, 181, 15):
-            az = np.deg2rad(yaw)
-            z = np.array([np.cos(az), np.sin(az), 0.0])
-            up = np.array([0.0, 0.0, 1.0])
-            base = np.column_stack((np.cross(up, z), up, z))
-            rot = base @ axes
-            turn = Rotation.from_matrix(park[:3, :3].T @ rot).magnitude()
-            for level in (0.49, 0.58, 0.40):
-                height = lo + level * (hi - lo)
+        for level, height, local_radius, local_center in sections:
+            key = (local_radius, cant, roll, station)
+            if key not in ctrl.wrap_cache:
+                ctrl.wrap_cache[key] = wall_fit(ctrl, *key)
+            axes, (cx, cz), opened, closed, tight = ctrl.wrap_cache[key]
+            shapes = ctrl.link_shapes(closed)
+            finger_height = [
+                (axes @ shapes[f"right_{d}_elastomer"].mean(0))[1] for d in DIGITS
+            ]
+            thumb_height = float(finger_height[0] - np.mean(finger_height[1:]))
+            for yaw in range(-165, 181, 15):
+                az = np.deg2rad(yaw)
+                z = np.array([np.cos(az), np.sin(az), 0.0])
+                up = np.array([0.0, 0.0, 1.0])
+                base = np.column_stack((np.cross(up, z), up, z))
+                rot = base @ axes
+                turn = Rotation.from_matrix(park[:3, :3].T @ rot).magnitude()
                 goal = np.eye(4)
                 goal[:3, :3] = rot
-                goal[:3, 3] = np.r_[center, height] - base @ [cx, 0, cz]
+                goal[:3, 3] = np.r_[local_center, height] - base @ [cx, 0, cz]
                 seat = shifted(goal, 0.003 * base[:, 0])
                 for retreat in (0.048, 0.073):
                     pre = shifted(
@@ -210,6 +233,7 @@ def wall_grasps(ctrl, surface):
                     score = (
                         0.015 * turn
                         + 0.12 * abs(level - 0.49)
+                        + 2.5 * max(0.0, radius - local_radius)
                         + 0.10 * np.linalg.norm(pre[:3, 3] - park[:3, 3])
                         + 0.032 * (1 - np.cos(az + np.pi / 12))
                         + 0.12 * retreat
@@ -226,8 +250,8 @@ def wall_grasps(ctrl, surface):
                             "q_touch": closed,
                             "q_tight": tight,
                             "fit": {
-                                "radius_m": radius,
-                                "waist_xy": center.tolist(),
+                                "radius_m": local_radius,
+                                "waist_xy": local_center.tolist(),
                                 "level": level,
                                 "yaw_deg": yaw,
                                 "cant_deg": cant,

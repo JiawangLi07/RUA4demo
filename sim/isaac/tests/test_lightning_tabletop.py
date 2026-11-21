@@ -303,3 +303,37 @@ def test_head_reacquisition_after_a_roll_requires_a_unique_mesh_fit():
     ctrl.head_pieces = [new]
     fit["p90_residual_m"] = 0.012
     assert ctrl.reacquire_head(ref, after_release=True) is None
+
+
+def test_tapered_wall_uses_the_radius_at_each_grasp_height(monkeypatch):
+    from sim.isaac import tabletop_adaptive as adaptive
+
+    def wall_fit(ctrl, radius, cant, roll, station):
+        q = np.zeros(22)
+        return np.eye(3), (radius, station), q, q, q
+
+    monkeypatch.setattr(adaptive, "wall_fit", wall_fit)
+    shapes = {f"right_{d}_elastomer": np.zeros((1, 3)) for d in adaptive.DIGITS}
+    ctrl = SimpleNamespace(
+        ik=SimpleNamespace(fk=lambda q: np.eye(4)),
+        reference_arm=np.zeros(7),
+        wrap_cache={},
+        link_shapes=lambda q: shapes,
+    )
+    z, theta = np.meshgrid(
+        np.linspace(0, 0.16, 81), np.linspace(0, 2 * np.pi, 96, endpoint=False)
+    )
+
+    def radii_by_level(radius):
+        world = np.stack((radius * np.cos(theta), radius * np.sin(theta), z), axis=-1)
+        surface = SimpleNamespace(world=world.reshape(-1, 3))
+        return {
+            card["fit"]["level"]: card["fit"]["radius_m"]
+            for _, card, _ in adaptive.wall_grasps(ctrl, surface)
+        }
+
+    cylinder = radii_by_level(np.full_like(z, 0.030))
+    assert cylinder == {0.40: 0.030, 0.49: 0.030, 0.58: 0.030}
+    tapered = radii_by_level(0.031 - 0.026 * np.clip((z / 0.16 - 0.35) / 0.65, 0, 1))
+    assert {0.46, 0.52, 0.55} <= tapered.keys()
+    assert tapered[0.58] < tapered[0.49]
