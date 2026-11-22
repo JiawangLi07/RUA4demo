@@ -112,3 +112,102 @@ def test_depth_conflict_distinguishes_a_free_ray_from_an_occluded_surface():
     np.testing.assert_allclose(free_space_error(points, frame), (0.010 - 0.0025) / 2)
     frame["depth"].fill(np.nan)
     assert free_space_error(points, frame) == 0.0
+
+
+def test_long_tool_placements_offer_centered_contacts_and_keep_original():
+    # Opposed horizontal pad sites 34 mm from the mass centre on a 140 mm rod.
+    x, y, z = np.meshgrid(
+        np.linspace(-0.07, 0.07, 141), [-0.006, 0.006], [-0.002, 0.002]
+    )
+    samples = np.column_stack([x.ravel(), y.ravel(), z.ravel()])
+    reg = np.eye(4)
+    reg[:3, 3] = [0.66, -0.14, 0.71]
+    surface = SimpleNamespace(
+        local=samples,
+        tree=cKDTree(samples),
+        camera_samples={},
+        world_parts=[samples + reg[:3, 3]],
+    )
+    targets = np.array([[[0.034, -0.006, 0.002], [0.034, 0.006, 0.002]]])
+    data = dict(
+        object_pose=np.eye(4)[None],
+        q=np.zeros((1, 22)),
+        contact_link_id=np.array([[0, 1]]),
+        target_pos=targets,
+        target_normal=np.zeros_like(targets),
+        source=np.array(["official"]),
+        source_id=np.array([0]),
+        link_names=["thumb", "index"],
+    )
+    chart, parents = tabletop_scene_refit.placements_from_prior(data, surface, reg)
+    offsets = chart["object_pose"][:, 0, 3]
+    assert np.isclose(offsets[0], 0) and np.isclose(offsets, 0.034).any()
+    assert np.all(parents == 0)
+
+
+def test_seated_pressure_keeps_a_loaded_pad_and_closes_the_opposed_gap():
+    from sim.isaac.tabletop_meshfit import retain_squeeze
+
+    sites = []
+    for j, (name, sign) in enumerate((("thumb", -1), ("middle", 1))):
+        sites.append(
+            dict(
+                link=name,
+                joint=j,
+                normal=np.array([sign, 0.0, 0.0]),
+                goal=np.array([sign * 0.02, 0.0, 0.01]),
+            )
+        )
+
+    def point_jac(site, palm, q):
+        j, direction = site["joint"], site["normal"]
+        jac = np.zeros((3, 8))
+        jac[:, 6 + j] = direction
+        return site["goal"] + q[j] * direction, None, jac, None
+
+    initial = np.array([-0.012, 0.002])
+    path, _, gaps = retain_squeeze(
+        SimpleNamespace(point_jac=point_jac),
+        np.eye(4),
+        initial,
+        sites,
+        np.array([[-0.05, 0.05]] * 2),
+        0.0,
+    )
+    np.testing.assert_allclose(path[:, 0], initial[0])
+    assert np.all(np.diff(path[:, 1]) <= 0) and -0.0031 < gaps["middle"] < -0.0028
+
+
+def test_probe_detects_rotation_about_table_before_accepting_rgbd_pixel_votes(
+    monkeypatch,
+):
+    from sim.isaac import tabletop_control, tabletop_tracking
+
+    ctrl = Controller.__new__(Controller)
+    ctrl.io = SimpleNamespace(fk=lambda link: np.eye(4))
+    ctrl.table, ctrl.camera_roles, ctrl.tracks = 0.7, ("head",), {"head": object()}
+    ctrl.adaptive, ctrl.template_comparison, ctrl.lift_height = True, False, 0.05
+    ctrl.event = lambda *a, **k: None
+    ctrl.snapshot = lambda *a: None
+    skin = SimpleNamespace(local=np.zeros((1, 3)), world=np.zeros((1, 3)))
+    track = dict(
+        texture_inliers=10,
+        texture_span_m=0.0083,
+        tracked_rise_m=0.00807,
+        tracked_bottom_rise_m=-0.00003,
+    )
+    monkeypatch.setattr(tabletop_tracking, "measure", lambda *a: track)
+    monkeypatch.setattr(
+        tabletop_control,
+        "match_height",
+        lambda *a: {"carried_pixels": 67, "static_pixels": 36},
+    )
+    assert (
+        ctrl.vote(skin, np.eye(4), np.eye(4), [], "test_observation")
+        == "pivot_on_table"
+    )
+    track["tracked_bottom_rise_m"] = 0.007
+    assert (
+        ctrl.vote(skin, np.eye(4), np.eye(4), [], "test_observation_repeat")
+        == "carried"
+    )

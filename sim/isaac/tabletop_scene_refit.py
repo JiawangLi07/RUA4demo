@@ -33,6 +33,34 @@ def placements_from_prior(data, surface, reg):
     shifted = poses.copy()
     shifted[:, :3, 3] -= shifted[:, :3, :3] @ delta
     batches = [shifted]
+    # Slide an off-centre grasp along a long horizontal object before solving its contacts again.
+    # Keep both the original and translated placements only where every active site follows the mesh.
+    from .tabletop_handle import volume_center
+    from .tabletop_opposition import long_horizontal_axis
+
+    world = surface.local @ reg[:3, :3].T + reg[:3, 3]
+    world_axis = long_horizontal_axis(world)
+    if world_axis is not None:
+        axis = world_axis @ reg[:3, :3]
+        com = (volume_center(surface.world_parts) - reg[:3, 3]) @ reg[:3, :3]
+        obj_sites = (data["target_pos"] - shifted[:, None, :3, 3]) @ shifted[:, :3, :3]
+        present = data["contact_link_id"] >= 0
+        mean = (obj_sites * present[:, :, None]).sum(1) / np.maximum(
+            1, present.sum(1, keepdims=True)
+        )
+        offset = np.clip((com - mean) @ axis, -0.045, 0.045)
+        for fraction in (1.0, 0.55):
+            move = fraction * offset[:, None] * axis
+            gaps = surface.tree.query(obj_sites + move[:, None])[0]
+            keep = indices[
+                (np.abs(fraction * offset) >= 0.006)
+                & (np.max(np.where(present, gaps, 0), axis=1) < 0.006)
+            ]
+            if len(keep):
+                trial = shifted[keep].copy()
+                trial[:, :3, 3] -= (trial[:, :3, :3] @ move[keep, :, None])[:, :, 0]
+                batches.append(trial)
+                groups.append(keep)
     if len(poses) < 24 or reg[2, 2] < -0.5:
         center = np.quantile(surface.local, [0.02, 0.98], axis=0).mean(axis=0)
         _, axes = np.linalg.eigh(np.cov(surface.local.T))

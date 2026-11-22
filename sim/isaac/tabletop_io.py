@@ -193,8 +193,22 @@ def connect(scene, out, side="right", audit=None):
     def commanded_joints():
         return command.copy()
 
+    arm_joints = [i for i, n in enumerate(names) if n.startswith("Joint")]
+    use_feedback = scene.config.get("arm_joint_feedback", False)
+
+    def joint_feedback():
+        # Joint-state telemetry available from the arm drives. Fingers retain their issued values.
+        angles = command.copy()
+        if use_feedback:
+            angles[arm_joints] = (
+                scene.robot.data.joint_pos[0, arm_joints].detach().cpu().numpy()
+            )
+        return angles
+
     def fk(link, angles=None):
-        return tree.pose(link, dict(zip(names, command if angles is None else angles)))
+        return tree.pose(
+            link, dict(zip(names, joint_feedback() if angles is None else angles))
+        )
 
     palm_eye = None if eye is None else np.linalg.solve(fk(palm), fk(tcp)) @ eye
 
@@ -202,7 +216,7 @@ def connect(scene, out, side="right", audit=None):
         if role not in roles:
             raise RuntimeError(f"camera {role} is disabled in this run")
         scene.sensor_calls[role] += 1
-        angles = commanded_joints()
+        angles = joint_feedback()
         if role == "head":
             sensor, pose, k = head, head_pose, head_k
         elif role == "wrist":
@@ -239,7 +253,10 @@ def connect(scene, out, side="right", audit=None):
             "K": k.copy(),
             "pose": pose.copy(),
             "q": angles,
-            "joint_source": "command",
+            "q_command": commanded_joints(),
+            "joint_source": "arm_feedback_finger_command"
+            if use_feedback
+            else "command",
             "time": scene.time,
         }
 
@@ -278,6 +295,7 @@ def connect(scene, out, side="right", audit=None):
         side=side,
         camera_roles=roles,
         commanded_joints=commanded_joints,
+        joint_feedback=joint_feedback,
         step=step,
         fk=fk,
         camera=camera,

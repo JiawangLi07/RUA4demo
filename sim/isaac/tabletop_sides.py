@@ -48,13 +48,18 @@ def canonical_left(io):
     def command():
         return io.commanded_joints()[indices] * signs
 
+    def feedback():
+        return getattr(io, "joint_feedback", io.commanded_joints)()[indices] * signs
+
     def fk(link, angles=None):
         return tree.pose(
-            link, dict(zip(names, command() if angles is None else angles))
+            link, dict(zip(names, feedback() if angles is None else angles))
         )
 
     def camera(role):
-        return reflected_frame(io.camera(role), mirror, command())
+        frame = reflected_frame(io.camera(role), mirror, feedback())
+        frame["q_command"] = command()
+        return frame
 
     def local_transform(name):
         return np.linalg.solve(
@@ -94,6 +99,7 @@ def canonical_left(io):
     canonical.arm = [names.index("Joint" + str(i) + "_R") for i in range(1, 8)]
     canonical.hand = [names.index(n) for n in io.model.hand_names["right"]]
     canonical.commanded_joints = command
+    canonical.joint_feedback = feedback
     canonical.step = lambda arm, hand: io.step(ARM_SIGNS * arm, hand)
     canonical.camera, canonical.fk = camera, fk
     canonical.model, canonical.bounds = model, bounds

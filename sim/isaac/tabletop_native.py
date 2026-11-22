@@ -185,6 +185,13 @@ def main():
         config["record_hand_table_contact"] = args.allow_hand_table_contact
         config["camera_mode"] = args.camera_mode
         config["wrist_hardware"] = hardware
+        arm_feedback = (
+            not args.observe_only
+            and args.adaptive_grasps
+            and args.camera_mode == "head"
+            and solver == "lightning_grasp"
+        )
+        config["arm_joint_feedback"] = arm_feedback
         if args.wrist_mount:
             config["wrist_mount"] = str(args.wrist_mount.resolve())
         scene = NativeBimanualScene(config, out, args.device)
@@ -220,8 +227,12 @@ def main():
                     json.dumps(
                         {
                             "lift_height_m": args.lift_height_m,
-                            "grasp_inputs": "rgbd_mesh_commanded_kinematics",
-                            "joint_observation": "issued_targets",
+                            "grasp_inputs": "head_rgbd_mesh_arm_joint_feedback"
+                            if arm_feedback
+                            else "rgbd_mesh_commanded_kinematics",
+                            "joint_observation": "arm_feedback_finger_targets"
+                            if arm_feedback
+                            else "issued_targets",
                             "closure_telemetry": "completed_command",
                             "hands": sides,
                             "camera_mode": args.camera_mode,

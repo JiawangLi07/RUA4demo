@@ -250,6 +250,12 @@ def batch(api, torch, ctx, obj, args, ncontact, placement_sampler=sample_placeme
         torch.as_tensor(x, device="cuda", dtype=torch.float32) for x in (pts, normals)
     ]
     valid = api.get_support_point_mask(all_pts, all_normals, [0.01])[0]
+    if getattr(args, "room", None) is not None:
+        from .tabletop_plane_sampling import placements
+
+        n = all_pts.new_tensor(args.room["normal"])
+        valid &= (all_pts @ n + args.room["offset"] > 0.004) & (all_normals @ n > -0.42)
+        placement_sampler = placements
     pts, normals = all_pts[valid], all_normals[valid]
     poses, condition = placement_sampler(
         api, torch, robot, field, tree, static, pts, normals, obj, args
@@ -339,10 +345,17 @@ def batch(api, torch, ctx, obj, args, ncontact, placement_sampler=sample_placeme
     )
     if result is None or not len(result["q"]):
         return {}, log
+    collision_points = all_pts
+    if getattr(args, "room", None) is not None:
+        from .tabletop_plane_sampling import tabletop_points
+
+        collision_points = torch.cat(
+            (all_pts, tabletop_points(torch, all_pts, args.room)), dim=0
+        )
     result = api.batch_assign_free_finger_and_filter(
         tree=tree,
         result=result,
-        object_point=all_pts,
+        object_point=collision_points,
         self_collision_link_pairs=pairs,
         decomposed_mesh_data=geometry,
     )
@@ -389,7 +402,32 @@ def main():
         action="store_true",
         help="seed the native solver from upright registered side-wall contacts",
     )
+    p.add_argument(
+        "--table-patch-prior",
+        type=Path,
+        help="optional NPZ of surface patches for plane-conditioned wrist proposals",
+    )
+    p.add_argument(
+        "--registered-planes",
+        type=Path,
+        help="head-registered support planes indexed by mesh stem",
+    )
+    p.add_argument(
+        "--placement-priors",
+        type=Path,
+        help="native object-to-palm poses for each mesh stem",
+    )
     a = p.parse_args()
+    if (a.registered_planes is None) != (a.placement_priors is None):
+        p.error("--registered-planes and --placement-priors must be supplied together")
+    if a.registered_planes and not a.tabletop:
+        p.error("--registered-planes requires --tabletop")
+    if a.table_patch_prior and not a.registered_planes:
+        p.error("--table-patch-prior requires --registered-planes")
+    a.patch_prior = None
+    if a.table_patch_prior:
+        with np.load(a.table_patch_prior) as patches:
+            a.patch_prior = dict(patches)
     if a.side_placements and not a.upright_wrap:
         p.error("--side-placements needs --upright-wrap")
     if a.upright_wrap and not (a.tabletop and a.power_contact):
@@ -414,6 +452,10 @@ def main():
     a.out.mkdir(parents=True, exist_ok=True)
     with torch.no_grad():
         for path in a.meshes:
+            if a.registered_planes:
+                a.room = json.loads(a.registered_planes.read_bytes())[path.stem]
+                with np.load(a.placement_priors / (path.stem + ".npz")) as prior:
+                    a.parents = prior["object_pose"]
             obj = api.MeshObject(str(path))
             attempts = []
             arrays = {}
@@ -469,6 +511,15 @@ def main():
                 candidates=len(values["q"]),
                 batches=attempts,
             )
+            if a.registered_planes:
+                receipt["head_registered_table"] = a.room
+                if a.table_patch_prior:
+                    receipt["table_patch_prior_sha256"] = hashlib.sha256(
+                        a.table_patch_prior.read_bytes()
+                    ).hexdigest()
+                receipt["placement_parent_sha256"] = hashlib.sha256(
+                    (a.placement_priors / (path.stem + ".npz")).read_bytes()
+                ).hexdigest()
             provenance = a.hand.parent / "station_provenance.json"
             if provenance.exists():
                 receipt["station"] = json.loads(provenance.read_bytes())

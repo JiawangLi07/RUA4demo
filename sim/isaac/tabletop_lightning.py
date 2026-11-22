@@ -178,13 +178,15 @@ class LightningBank:
                 data["source_id"] = (
                     z["source_id"] if "source_id" in z else np.arange(len(z["q"]))
                 )
+                # Native, transferred and scene-refitted banks use the same link-local anchors.
+                if "contact_pos" in z and "contact_normal" in z:
+                    data["contact_pos"] = z["contact_pos"]
+                    data["contact_normal"] = z["contact_normal"]
                 if repo.get("method") == "live_scene_contact_refit":
                     for key in (
                         "arm_pre",
                         "pre_in_palm",
                         "q_open",
-                        "contact_pos",
-                        "contact_normal",
                     ):
                         data[key] = z[key]
                 if repo.get("method") in (
@@ -212,7 +214,15 @@ class LightningBank:
                         raise ValueError("unexpected source in arm-conditioned bank")
                 if not all(
                     np.isfinite(data[k]).all()
-                    for k in ("q", "object_pose", "target_pos", "target_normal")
+                    for k in (
+                        "q",
+                        "object_pose",
+                        "target_pos",
+                        "target_normal",
+                        "contact_pos",
+                        "contact_normal",
+                    )
+                    if k in data
                 ):
                     raise ValueError("nonfinite Lightning Grasp output")
                 repo["bank_sha256"] = hashlib.sha256(file.read_bytes()).hexdigest()
@@ -543,6 +553,37 @@ class LightningBank:
         if conditioned:
             closure_mode = "seated_wrap" if direct_seat else "power_wrap"
 
+        from .tabletop_opposition import LowerEdge, native_opposition
+
+        guard = LowerEdge(surface, ctrl.table) if np.any(eligible) else None
+        opposed, lateral_dot, lower_count = native_opposition(
+            poses, data, links, present
+        )
+        eligible &= opposed
+        capacity = lever = None
+        if np.any(eligible) and (
+            (not conditioned and not power_body) or receipt.get("continuous_lower_edge")
+        ):
+            from .tabletop_handle import volume_center
+            from .tabletop_opposition import lateral_load_capacity, long_horizontal_axis
+
+            capacity, _ = lateral_load_capacity(
+                surface, xyz, poses, data, present, eligible
+            )
+            lever = np.linalg.norm(
+                centroid[:, :2] - volume_center(surface.world_parts)[:2], axis=1
+            )
+            if receipt.get("continuous_lower_edge"):
+                eligible &= capacity >= 0.14
+            # A row with normal opposition can still pivot about one end of a tool.
+            # Score how much upward load its friction cones can balance about the mesh's centre.
+            if long_horizontal_axis(surface.local @ reg[:3, :3].T) is not None:
+                score += 10.0 * np.minimum(capacity, 1.25) - 65.0 * lever
+            else:
+                score -= 16.0 * np.maximum(0.55 - capacity, 0.0) + 85.0 * np.maximum(
+                    lever - 0.020, 0.0
+                )
+        counts["thumb_opposed_with_limited_lower_support"] = int(eligible.sum())
         choices = np.flatnonzero(eligible)
         if getattr(ctrl, "allow_hand_table_contact", False):
             # A light brush is admissible. A palm placement well through the rigid
@@ -551,7 +592,17 @@ class LightningBank:
                 lowest = (ctrl.shape(data["q"][row]) @ poses[row, 2, :3]).min() + poses[
                     row, 2, 3
                 ]
-                score[row] -= 850 * max(0.0, ctrl.table - lowest - 0.001)
+                # Include the open approach: extended fingers can hit the desk
+                # before a valid final contact shape is reached.
+                preview = data["q"][row].copy()
+                preview[flex] = ctrl.open_hand[flex] + 0.4 * (
+                    preview[flex] - ctrl.open_hand[flex]
+                )
+                open_low = (ctrl.shape(preview) @ poses[row, 2, :3]).min() + poses[
+                    row, 2, 3
+                ]
+                score[row] -= 1600 * max(0.0, ctrl.table - lowest - 0.001)
+                score[row] -= 900 * max(0.0, ctrl.table - open_low - 0.001)
         order = choices[np.lexsort((-score[choices], -tier[choices]))]
         reached = []
         reach_trace = {}
@@ -588,6 +639,29 @@ class LightningBank:
             )
             if guided:
                 open_q = data["q_open"][i]
+            elif not require_wrap and getattr(ctrl, "allow_hand_table_contact", False):
+                # Keep a finger opening around the object while avoiding the
+                # extended-finger posture driving into the support plane.
+                for fraction in (0.23, 0.42, 0.60):
+                    open_q[flex] = ctrl.open_hand[flex] + fraction * (
+                        q[flex] - ctrl.open_hand[flex]
+                    )
+                    if (ctrl.shape(open_q) @ palm[2, :3]).min() + palm[
+                        2, 3
+                    ] >= ctrl.table - 0.002:
+                        break
+            try:
+                _, tight_q, _ = seating(i)
+                lower = set()
+                for start, end in ((open_q, q), (q, tight_q)):
+                    for fraction in (0.0, 0.33, 0.66, 1.0):
+                        lower |= guard.check(
+                            ctrl, palm, start + fraction * (end - start)
+                        )
+                if len(lower) > 2:
+                    continue
+            except NoPath:
+                continue
             geometry = ctrl.link_shapes(open_q)
             toward_out = -palm[:3, 0]
             pre_options = [
@@ -729,6 +803,10 @@ class LightningBank:
             "bank_row": int(i),
             "candidate_source": str(data["source"][i]),
             "source_id": int(data["source_id"][i]),
+            "estimated_upward_capacity": float(capacity[i])
+            if capacity is not None
+            else None,
+            "contact_lever_xy_m": float(lever[i]) if lever is not None else None,
         }
         if "source_domain_sha256" in data:
             identity["domain_sha256"] = str(data["source_domain_sha256"][i])
@@ -770,13 +848,16 @@ class LightningBank:
             palm_grasp=palm.tolist(),
             native_q=q.tolist(),
             seated_q=data["seated_q"][i].tolist() if "seated_q" in data else None,
+            approach_policy="thumb_opposed_limited_lower_edge",
+            opposed_horizontal_dot=float(lateral_dot[i]),
+            native_lower_non_thumb_digits=int(lower_count[i]),
             hand_model="sharpa_22",
             bank_side=self.side,
             bank_input_sha256=receipt["input_sha256"],
         )
         knots = []
         native_sites = []
-        if receipt.get("method") == "live_scene_contact_refit":
+        if not conditioned and "contact_pos" in data and "contact_normal" in data:
             for j in np.flatnonzero(present[i]):
                 native_sites.append(
                     dict(
@@ -800,6 +881,7 @@ class LightningBank:
                 data["target_pos"][i, present[i]],
             )
         return dict(
+            lower_guard=guard,
             native_sites=native_sites,
             seating_knots=knots,
             explicit_digits=digits[i].tolist(),

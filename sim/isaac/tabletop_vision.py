@@ -43,17 +43,17 @@ def foreground(frame, io, table=None):
     world, valid = world_image(frame)
     roi = (
         valid
-        & (world[:, :, 0] > 0.49)
+        & (world[:, :, 0] > 0.41)
         & (world[:, :, 0] < 1.12)
         & (world[:, :, 1] > -0.67)
         & (world[:, :, 1] < 0.40)
     )
     z = world[:, :, 2]
     if table is None:
-        heights = z[roi & (z > 0.66) & (z < 0.77)]
+        heights = z[roi & (z > 0.66) & (z < 0.82)]
         if len(heights) < 200:
             raise ValueError("table is not observable")
-        count, edges = np.histogram(heights, bins=130, range=(0.655, 0.785))
+        count, edges = np.histogram(heights, bins=180, range=(0.655, 0.835))
         t = edges[count.argmax()] + 0.0005
         table = float(np.median(heights[np.abs(heights - t) < 0.0025]))
     mask = roi & (z > table + 0.003) & (z < table + 0.36)
@@ -85,7 +85,7 @@ def proposals(frame, io, table=None):
     if not len(xyz):
         return table, []
     cell = 0.0035
-    grid = np.floor((xyz[:, :2] - [0.48, -0.68]) / cell).astype(int)
+    grid = np.floor((xyz[:, :2] - [0.40, -0.68]) / cell).astype(int)
     occupied = np.zeros(tuple(grid.max(0) + 3), bool)
     occupied[tuple(grid.T)] = True
     labels, _ = ndimage.label(

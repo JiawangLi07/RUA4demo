@@ -588,22 +588,93 @@ def carry_shape(hand, palm, seated, contacts, limits, table):
     return path[-1]
 
 
-def close_from_mesh(controller, contacts):
+def retain_squeeze(hand, palm, initial, contacts, limits, table):
+    """Add normal displacement to the seated motor targets while retaining existing compression."""
+    sites = [s for s in contacts if s["link"] != PALM]
+    if not sites:
+        return np.asarray([initial]), {}, {}
+    start = [hand.point_jac(s, palm, initial)[0] for s in sites]
+    depths, extra = [], []
+    for s, point in zip(sites, start):
+        opponents = [
+            o for o in sites if ("thumb" in o["link"]) != ("thumb" in s["link"])
+        ]
+        width = max(
+            (abs((s["goal"] - o["goal"]) @ s["normal"]) for o in opponents), default=0
+        )
+        depth = float(np.clip(0.22 * width, 0.003, 0.010))
+        # Moving a motor target back towards its nominal contact can unload an already seated pad.
+        signed = float((point - s["goal"]) @ s["normal"])
+        extra.append(float(np.clip(depth + signed, 0, 0.005)))
+        depths.append(depth)
+    q = initial.copy()
+    path = [q.copy()]
+    for alpha in np.linspace(0.125, 1, 8):
+        jac, error = [], []
+        for site, origin, distance in zip(sites, start, extra):
+            pt, _, jp, _ = hand.point_jac(site, palm, q)
+            goal = origin - alpha * distance * site["normal"]
+            goal[2] = max(goal[2], min(origin[2], table + 0.001))
+            jac.append(jp[:, 6:])
+            error.append(goal - pt)
+        jac = np.vstack(jac)
+        dq = np.linalg.solve(
+            jac.T @ jac + 0.00006 * np.eye(len(q)), jac.T @ np.concatenate(error)
+        )
+        q = np.clip(q + np.clip(dq, -0.055, 0.055), *limits.T)
+        path.append(q.copy())
+    gaps = {
+        s["link"]: float((hand.point_jac(s, palm, q)[0] - s["goal"]) @ s["normal"])
+        for s in sites
+    }
+    return np.asarray(path), {s["link"]: d for s, d in zip(sites, depths)}, gaps
+
+
+def close_from_mesh(controller, contacts, *, seated=False):
     io = controller.io
-    path, depths, gaps = closure_path(
+    palm = io.fk(PALM)
+    solve = retain_squeeze if seated else closure_path
+    path, depths, gaps = solve(
         controller.hand_contacts,
-        controller.ik.fk(controller.arm),
+        palm,
         controller.hand,
         contacts,
         io.model.limits["right"],
         controller.table,
     )
+    planned_steps = len(path)
+    guard = getattr(controller, "lower_guard", None)
+    if guard is not None:
+        touched = set(guard.used)
+        for i, hand in enumerate(path):
+            updated = touched | guard.fingers(controller, palm, hand)
+            if len(updated) > 2:
+                if i == 0:
+                    from .tabletop_control import NoPath
+
+                    raise NoPath("seated hand exceeds lower-finger support limit")
+                path = path[:i]
+                gaps = {
+                    s["link"]: float(
+                        (
+                            controller.hand_contacts.point_jac(s, palm, path[-1])[0]
+                            - s["goal"]
+                        )
+                        @ s["normal"]
+                    )
+                    for s in contacts
+                    if s["link"] != PALM
+                }
+                break
+            touched = updated
+        guard.used.update(touched)
     controller.event(
         "planned_mesh_closure",
         q_start=path[0].tolist(),
         q_end=path[-1].tolist(),
         normal_preload_m=depths,
         predicted_signed_gap_m=gaps,
+        guard_truncated=len(path) < planned_steps,
         path_q=path.tolist(),
     )
     ticks = max(2, round(0.055 / io.dt))

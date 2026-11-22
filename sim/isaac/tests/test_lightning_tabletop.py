@@ -66,6 +66,8 @@ def test_bank_preserves_native_indices_and_rejects_mismatched_object(tmp_path):
             key: np.zeros((1, 5, 3))
             for key in ("target_pos", "contact_pos", "target_normal", "contact_normal")
         }
+        data["contact_pos"][0, 0] = [0.002, 0.001, -0.004]
+        data["contact_normal"][0, 0] = [0, 0, 1]
         np.savez(
             path,
             **data,
@@ -87,6 +89,8 @@ def test_bank_preserves_native_indices_and_rejects_mismatched_object(tmp_path):
     assert data["source"].tolist() == ["native", "power"]
     assert data["source_id"].tolist() == [0, 0]
     assert np.array_equal(data["q"], np.ones((2, 22)))
+    np.testing.assert_allclose(data["contact_pos"][:, 0], [[0.002, 0.001, -0.004]] * 2)
+    np.testing.assert_allclose(data["contact_normal"][:, 0], [[0, 0, 1]] * 2)
     bad = source(tmp_path / "wrong", "different")
     with pytest.raises(ValueError, match="incompatible"):
         merge([a, bad], out)

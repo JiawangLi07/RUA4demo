@@ -163,6 +163,7 @@ class Controller:
         self.shared = shared
         if not 0.03 <= lift_height <= 0.20:
             raise ValueError("expected a lift goal between 0.03 and 0.20 metres")
+        self.seat_trim = None
         self.lift_height = lift_height
         # Allow for a few millimetres of object settling during continuous closure.
         self.lift_travel = lift_height + (0.017 if lightning is not None else 0.009)
@@ -418,7 +419,12 @@ class Controller:
                 else "camera fixture"
             )
             raise NoPath(f"{part} would intersect the table")
+        guard = getattr(self, "lower_guard", None)
+        lower = guard.sweep(self, joints, start, hand) if guard is not None else set()
         arc = np.r_[0.0, np.cumsum(np.max(np.abs(np.diff(joints, axis=0)), axis=1))]
+        # The cubic has peak slope 1.5 and ends at 84% of the interval.
+        # Leave tracking headroom below the arm drive's approximately 3.14 rad/s limit.
+        duration = max(duration, 1.5 * arc[-1] / (0.84 * 2.25))
         ticks = max(2, round(duration / io.dt))
         for i in range(1, ticks + 1):
             f = min(1.0, i / (0.84 * ticks))
@@ -429,6 +435,8 @@ class Controller:
             arm = joints[k] + blend * (joints[k + 1] - joints[k])
             io.step(arm, start + f * (hand - start))
         self.arm, self.hand = joints[-1].copy(), hand.copy()
+        if guard is not None:
+            guard.used.update(lower)
 
     def move(
         self,
@@ -1231,7 +1239,21 @@ class Controller:
                 if tag.startswith("test_observation")
                 else (self.lift_height, self.lift_height)
             )
-            if all(
+            pivot = (
+                tag.startswith("test_observation")
+                and self.adaptive
+                and any(
+                    v["texture_inliers"] >= 6
+                    and v.get("texture_span_m", 0) >= 0.008
+                    and v["tracked_bottom_rise_m"] <= 0.0035
+                    and v["tracked_rise_m"] - v["tracked_bottom_rise_m"] >= 0.006
+                    and v["tracked_rise_m"] >= 0.006
+                    for v in tracks
+                )
+            )
+            if pivot:
+                vote = "pivot_on_table"
+            elif all(
                 v["tracked_rise_m"] >= good[0] and v["tracked_bottom_rise_m"] >= good[1]
                 for v in tracks
             ):
@@ -1298,6 +1320,7 @@ class Controller:
             def endpoint_check(arm):
                 self.lightning_lift_ik(grasp, arm)
 
+        self.lower_guard = seed.get("lower_guard")
         self.event("approach", posture=seed["posture"])
         self.move(
             pre,
@@ -1327,6 +1350,7 @@ class Controller:
                 raise NoPath("executed pregrasp has insufficient lift reach")
 
     def trial(self, observed, result):
+        self.seat_trim = None
         name = self.name
         surface, pose, poses, seed, others = self.geometry(name, observed, result)
         for plan_no in range(4):
@@ -1336,6 +1360,7 @@ class Controller:
                 self.approach(seed, poses, surface, others)
                 break
             except NoPath as exc:
+                self.lower_guard = None
                 if not self.adaptive or self.io.time() != start or plan_no == 3:
                     raise
                 self.event(
@@ -1349,7 +1374,25 @@ class Controller:
         first = self.io.fk(PALM)
         close_started = False
         source = {"origin": seed["origin"], **seed.get("lightning_candidate", {})}
+        native_registration = pose.copy()
         try:
+            verified = (
+                self.adaptive
+                and "wrist" not in self.camera_roles
+                and seed["origin"] == "lightning_grasp"
+                and not seed.get("power_wrap")
+            )
+            if verified:
+                from .tabletop_servo import seat_before_close
+
+                surface, pose, shift = seat_before_close(self, surface, pose, grasp, qo)
+                grasp, tight = shifted(grasp, shift), shifted(tight, shift)
+                if getattr(self, "lower_guard", None) is not None:
+                    from .tabletop_opposition import LowerEdge
+
+                    old = self.lower_guard
+                    self.lower_guard = LowerEdge(surface, self.table)
+                    self.lower_guard.used.update(old.used)
             self.event(
                 "close",
                 posture=seed["posture"],
@@ -1363,10 +1406,27 @@ class Controller:
             )
             if seed["origin"] == "lightning_grasp" and not power_wrap:
                 # Seat the open hand before applying the native joint solution.
-                seat = shifted(grasp, -0.009 * grasp[:3, 0])
-                self.closing(seat, qo, 0.48)
-                self.closing(grasp, qt, 0.65)
+                if not verified:
+                    seat = shifted(grasp, -0.009 * grasp[:3, 0])
+                    self.closing(seat, qo, 0.48)
+                from .tabletop_servo import move_native_sites, opposed_touch
+
                 sites = seed.get("native_sites", [])
+                geometry = seed["lightning_candidate"]
+                capacity = geometry.get("estimated_upward_capacity")
+                risky = capacity is not None and (
+                    capacity < 0.5 or geometry["contact_lever_xy_m"] > 0.020
+                )
+                if sites:
+                    move_native_sites(sites, native_registration, pose)
+                if verified and sites and risky:
+                    surface, pose, correction = opposed_touch(
+                        self, surface, pose, sites, grasp, qt
+                    )
+                    tight = shifted(tight, correction)
+                else:
+                    self.closing(grasp, qt, 0.65)
+                self.closing(tight, qc, 0.42)
                 if sites:
                     from .tabletop_handle import reobserve
                     from .tabletop_meshfit import close_from_mesh
@@ -1374,14 +1434,9 @@ class Controller:
                     observed_surface, measured = reobserve(
                         self, surface, pose, tag="native_seated"
                     )
-                    motion = measured @ np.linalg.inv(pose)
-                    for site in sites:
-                        site["goal"] = motion[:3, :3] @ site["goal"] + motion[:3, 3]
-                        site["normal"] = motion[:3, :3] @ site["normal"]
+                    move_native_sites(sites, pose, measured)
                     surface, pose = observed_surface, measured
-                    close_from_mesh(self, sites)
-                else:
-                    self.closing(tight, qc, 0.42)
+                    close_from_mesh(self, sites, seated=True)
                 self.hold(0.20)
             elif power_wrap:
                 from .paths import RIGHT_JOINTS
@@ -1531,7 +1586,13 @@ class Controller:
                     self.closing(palm0, carry, 0.52)
                 palm0 = self.io.fk(PALM)
                 first = palm0
-            if sites:
+            if getattr(self, "lower_guard", None) is not None:
+                self.lower_guard.carry_reference = palm0.copy()
+                self.event(
+                    "opposed_carry",
+                    lower_non_thumb_digits=sorted(self.lower_guard.used),
+                )
+            elif sites:
                 from .tabletop_meshfit import carry_shape
 
                 carry = carry_shape(
@@ -1553,11 +1614,14 @@ class Controller:
             verdict = self.vote(
                 surface, pose, palm0, observed["color"], "test_observation"
             )
-            if verdict == "unknown":
+            first_vote = verdict
+            if verdict in ("unknown", "pivot_on_table"):
                 self.hold(0.14)
                 verdict = self.vote(
                     surface, pose, palm0, observed["color"], "test_observation_repeat"
                 )
+                if first_vote == verdict == "pivot_on_table":
+                    return verdict
             if seed.get("seated_q") is not None and verdict == "carried":
                 free = {
                     d: np.array([-0.004, 0.0, -0.003])
@@ -1709,6 +1773,13 @@ class Controller:
                 else "unconfirmed"
             )
         finally:
+            self.seat_trim = None
+            if getattr(self, "lower_guard", None) is not None:
+                self.event(
+                    "opposition_guard_end",
+                    lower_non_thumb_digits=sorted(self.lower_guard.used),
+                )
+                self.lower_guard = None
             if close_started:
                 self.tracks = {}
                 self.event("lower_and_release")
@@ -1756,6 +1827,8 @@ class Controller:
     def closing(self, goal, hand, seconds):
         start = self.arm.copy()
         target = self.ik.solve(goal, start)
+        if self.seat_trim is not None:
+            target = np.clip(target + self.seat_trim, *self.ik.bounds)
         self.command([start, target], hand, seconds)
 
     def execute(self, targets=None, finish=True):
