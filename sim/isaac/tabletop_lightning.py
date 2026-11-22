@@ -432,7 +432,10 @@ class LightningBank:
                         if np.quantile(surface.tree.query(points)[0], 0.05) <= 0.006:
                             supported[i, j] = True
                             break
-        eligible &= digits.sum(1) >= (2 if adaptive else 3)
+        minimum_digits = max(2 if adaptive else 3, getattr(ctrl, "min_contact_digits", 2))
+        eligible &= digits.sum(1) >= minimum_digits
+        counts["minimum_contact_digits"] = minimum_digits
+        counts["digit_filter_survivors"] = int(eligible.sum())
         # A native finger solution and a nearby palm patch are both required for
         # an enveloping grasp. Other shapes can use an opposed multi-digit grip.
         tier = np.ones(len(poses), dtype=int)

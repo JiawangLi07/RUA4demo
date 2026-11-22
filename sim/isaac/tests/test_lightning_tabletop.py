@@ -275,6 +275,14 @@ def test_long_body_cannot_close_a_native_pinch_with_a_distant_palm(gap):
         bank.select(ctrl, "item", SimpleNamespace(local=points), np.eye(4), None, [])
     assert events[-1]["full_wrap_required"] and events[-1]["contact_geometry"] == 0
 
+    # Repeated sites on the same finger cannot satisfy a requested three-digit pinch.
+    data["contact_link_id"] = np.array([[0, 4, 4, -1, -1]])
+    ctrl.min_contact_digits = 3
+    with pytest.raises(NoPath):
+        bank.select(ctrl, "item", SimpleNamespace(local=points * 0.2), np.eye(4), None, [])
+    assert events[-1]["minimum_contact_digits"] == 3
+    assert events[-1]["digit_filter_survivors"] == 0
+
 
 def test_static_palm_contact_joins_native_contact_search_in_object_frame():
     from scipy.spatial.transform import Rotation

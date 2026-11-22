@@ -94,6 +94,12 @@ def main():
         help="directory of native Sharpa Lightning Grasp banks",
     )
     parser.add_argument(
+        "--min-contact-digits",
+        type=int,
+        choices=range(2, 6),
+        help="minimum number of distinct digits with native contact sites in a Lightning candidate",
+    )
+    parser.add_argument(
         "--scene-candidates",
         type=int,
         choices=range(1, 5),
@@ -158,6 +164,8 @@ def main():
                 solver, bank_path = grasp_source(args)
         except ValueError as error:
             parser.error(str(error))
+    if args.min_contact_digits is not None and (args.observe_only or solver != "lightning_grasp"):
+        parser.error("--min-contact-digits requires native Lightning candidates")
     hardware = (
         args.wrist_hardware
         or {"head": "removed", "head-wrist": "mounted", "left-observer": "left-only"}[
@@ -260,6 +268,7 @@ def main():
                             "wrist_hardware": hardware,
                             "solver": solver,
                             "scene_candidate_limit": args.scene_candidates,
+                            "min_contact_digits": args.min_contact_digits,
                             "allow_hand_table_contact": args.allow_hand_table_contact,
                             "adaptive_grasps": args.adaptive_grasps,
                             "mount_installed": scene.fixture_path is not None,
@@ -299,6 +308,7 @@ def main():
                             bank,
                             args.adaptive_grasps,
                             hybrid_grasps=args.hybrid_grasps,
+                            min_contact_digits=args.min_contact_digits or 2,
                             allow_hand_table_contact=args.allow_hand_table_contact,
                         )
                     )

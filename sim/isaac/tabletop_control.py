@@ -152,11 +152,13 @@ class Controller:
         adaptive=False,
         hybrid_grasps=False,
         allow_hand_table_contact=False,
+        min_contact_digits=2,
     ):
         self.io, self.library, self.out = io, library, out
         self.side = getattr(io, "side", "right")
         self.models = Models(library, mirror=self.side == "left", rest_faces=adaptive)
         self.lightning = lightning
+        self.min_contact_digits = min_contact_digits
         self.adaptive = adaptive
         self.allow_hand_table_contact = allow_hand_table_contact
         self.hybrid_grasps = hybrid_grasps
