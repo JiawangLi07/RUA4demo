@@ -151,12 +151,14 @@ class Controller:
         lightning=None,
         adaptive=False,
         hybrid_grasps=False,
+        allow_hand_table_contact=False,
     ):
         self.io, self.library, self.out = io, library, out
         self.side = getattr(io, "side", "right")
         self.models = Models(library, mirror=self.side == "left", rest_faces=adaptive)
         self.lightning = lightning
         self.adaptive = adaptive
+        self.allow_hand_table_contact = allow_hand_table_contact
         self.hybrid_grasps = hybrid_grasps
         self.shared = shared
         if not 0.03 <= lift_height <= 0.20:
@@ -221,6 +223,8 @@ class Controller:
 
     def survey(self, wrist=False):
         frame = self.snapshot("wrist" if wrist else "head", "survey")
+        if not wrist:
+            self.survey_frame = frame
         self.table, pieces = proposals(frame, self.io, self.table)
         if not wrist:
             if self.adaptive and self.table_front_x is None:
@@ -340,7 +344,10 @@ class Controller:
         if not self.approach_orientation_clear(pose) or not self.fixture_clear(pose):
             return False
         vertices = local_vertices @ pose[:3, :3].T + pose[:3, 3]
-        if vertices[:, 2].min() < self.table - 0.0015:
+        if (
+            not getattr(self, "allow_hand_table_contact", False)
+            and vertices[:, 2].min() < self.table - 0.0015
+        ):
             return False
         if others is not None and len(others.data):
             distance = others.query(vertices, distance_upper_bound=0.005)[0]
@@ -739,7 +746,14 @@ class Controller:
         from .head_wrist_surface import RegisteredSurface
 
         try:
-            surface, pose, fit = self.models.fit(name, observed["xyz"], self.table)
+            surface, pose, fit = self.models.fit(
+                name,
+                observed["xyz"],
+                self.table,
+                depth_frame=self.survey_frame
+                if self.allow_hand_table_contact
+                else None,
+            )
             self.event(
                 "registered_head",
                 points=len(observed["xyz"]),
@@ -827,6 +841,18 @@ class Controller:
 
     def geometry(self, name, observed, choice):
         surface, pose, accurate = self.coarse_surface(name, observed)
+        surface.allow_hand_table_contact = self.allow_hand_table_contact
+        if self.allow_hand_table_contact and self.lightning is not None:
+            size = np.ptp(surface.world, axis=0)
+            horizontal = np.linalg.norm(size[:2])
+            # The far tip of a long tool can hang below its initial pose if it
+            # rotates a few degrees on the pads. Reserve travel from the observed geometry.
+            tip_allowance = (
+                min(0.012, 0.5 * horizontal * np.sin(np.deg2rad(8)))
+                if horizontal > 2 * size[2]
+                else 0.0
+            )
+            self.lift_travel = self.lift_height + 0.017 + tip_allowance
         target = observed["xyz"]
         cloud = self.cloud
         if len(cloud):
@@ -1340,7 +1366,22 @@ class Controller:
                 seat = shifted(grasp, -0.009 * grasp[:3, 0])
                 self.closing(seat, qo, 0.48)
                 self.closing(grasp, qt, 0.65)
-                self.closing(tight, qc, 0.42)
+                sites = seed.get("native_sites", [])
+                if sites:
+                    from .tabletop_handle import reobserve
+                    from .tabletop_meshfit import close_from_mesh
+
+                    observed_surface, measured = reobserve(
+                        self, surface, pose, tag="native_seated"
+                    )
+                    motion = measured @ np.linalg.inv(pose)
+                    for site in sites:
+                        site["goal"] = motion[:3, :3] @ site["goal"] + motion[:3, 3]
+                        site["normal"] = motion[:3, :3] @ site["normal"]
+                    surface, pose = observed_surface, measured
+                    close_from_mesh(self, sites)
+                else:
+                    self.closing(tight, qc, 0.42)
                 self.hold(0.20)
             elif power_wrap:
                 from .paths import RIGHT_JOINTS
@@ -1554,7 +1595,37 @@ class Controller:
                 if not self.adaptive or stationary:
                     return verdict
                 self.event("continue_visual_probe", initial_vote=verdict)
-            top = shifted(palm0, [0, 0, self.lift_travel])
+            travel = self.lift_travel
+            if self.allow_hand_table_contact and sites and verdict == "carried":
+                measured = []
+                for view in self.lift_views.values():
+                    if view.get("texture_inliers", 0) >= 5:
+                        measured.append(
+                            min(view["tracked_rise_m"], view["tracked_bottom_rise_m"])
+                        )
+                    if (
+                        view.get("height_support", 0) >= 24
+                        and view.get("height_margin_m", 0) >= 0.0009
+                    ):
+                        measured.append(view["visible_lift_m"])
+                if measured and min(measured) >= 0.005:
+                    wrist_rise = self.io.fk(PALM)[2, 3] - palm0[2, 3]
+                    takeup = float(np.clip(wrist_rise - min(measured), 0, 0.016))
+                    if takeup >= 0.002:
+                        suggested = shifted(palm0, [0, 0, travel + takeup])
+                        try:
+                            checked = self.ik.solve(suggested, self.arm)
+                        except NoPath:
+                            checked = None
+                        if checked is not None and self.arm_above_table(checked):
+                            travel += takeup
+                            self.event(
+                                "compensate_probe_slip",
+                                visual_rise_m=min(measured),
+                                commanded_wrist_rise_m=float(wrist_rise),
+                                extra_travel_m=takeup,
+                            )
+            top = shifted(palm0, [0, 0, travel])
             if power_wrap:
                 from .tabletop_adaptive import thumb_up_carry
 
@@ -1812,6 +1883,40 @@ class Controller:
                             for e in self.events
                         )
                         local = self.reacquire_head(last_seen, after_release=released)
+                        if (
+                            local is None
+                            and self.name not in fresh
+                            and released
+                            and self.allow_hand_table_contact
+                            and last_seen is not None
+                        ):
+                            palm = self.io.fk(PALM)
+                            eye = self.io.camera("head")["pose"][:3, 3]
+                            sight = np.asarray(last_seen["center"])[:2] - eye[:2]
+                            lateral = np.array([-sight[1], sight[0]])
+                            lateral /= max(1e-8, np.linalg.norm(lateral))
+                            if lateral @ (palm[:2, 3] - last_seen["center"][:2]) < 0:
+                                lateral *= -1
+                            for sign in (1, -1):
+                                goal = shifted(
+                                    palm, np.r_[sign * 0.065 * lateral, 0.018]
+                                )
+                                try:
+                                    self.move(
+                                        goal,
+                                        self.hand,
+                                        0.48,
+                                        cKDTree(self.cloud),
+                                        transit=True,
+                                    )
+                                except NoPath:
+                                    continue
+                                self.event("clear_head_view")
+                                fresh = self.survey()
+                                local = self.reacquire_head(
+                                    last_seen, after_release=True
+                                )
+                                break
                         if local is not None:
                             feedback[self.name] = local
                     if self.name in fresh and (

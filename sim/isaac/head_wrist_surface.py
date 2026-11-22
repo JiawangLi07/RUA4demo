@@ -10,6 +10,30 @@ from scipy.spatial.transform import Rotation
 from .head_wrist_geometry import hand_shapes
 
 
+def free_space_error(world, frame):
+    """Mean depth contradiction in metres over projected metric mesh samples."""
+    depth, k, eye = (frame[key] for key in ("depth", "K", "pose"))
+    camera = (world - eye[:3, 3]) @ eye[:3, :3]
+    z = camera[:, 2]
+    uv = np.rint(
+        camera[:, :2] / np.maximum(z[:, None], 1e-6) * [k[0, 0], k[1, 1]]
+        + k[:2, 2]
+    ).astype(int)
+    mask = (
+        (z > 0.03)
+        & (uv[:, 0] >= 0)
+        & (uv[:, 0] < depth.shape[1])
+        & (uv[:, 1] >= 0)
+        & (uv[:, 1] < depth.shape[0])
+    )
+    values = depth[uv[mask, 1], uv[mask, 0]]
+    valid = np.isfinite(values) & (values > 0.03) & (values < 2.2)
+    if not valid.any():
+        return 0.0
+    # An occluder in front of the predicted surface is not a free-space violation.
+    return float(np.clip(values[valid] - z[mask][valid] - 0.0025, 0, 0.045).mean())
+
+
 class RegisteredSurface:
     """A support-aligned local mesh, with pose inferred from the exposed surface."""
 
@@ -51,7 +75,7 @@ class RegisteredSurface:
             self.detail_points = (1-u[:, None])*tri[ids, 0] + (u*(1-v))[:, None]*tri[ids, 1] + (u*v)[:, None]*tri[ids, 2]
             self.detail_normals = normal[ids]
 
-    def register(self, observed, table, *, rest_faces=False):
+    def register(self, observed, table, *, rest_faces=False, depth_frame=None):
         points = observed[:: max(1, len(observed) // 680)]
         zlo = self.support[:, 2].min()
         prior = self.fit
@@ -59,17 +83,49 @@ class RegisteredSurface:
         def pose(params):
             # The rest face is a class prior. Small tilts are measured from this exposure.
             rotation = Rotation.from_euler("zyx", params[2:5]).as_matrix()
-            shift = np.array([params[0], params[1], table - np.min(self.support @ rotation[2])])
+            shift = np.array(
+                [params[0], params[1], table - np.min(self.support @ rotation[2])]
+            )
             return rotation, shift
 
         def residual(params):
             rot, shift = pose(params)
             return self.tree.query((points - shift) @ rot)[0]
 
+        samples = self.local[:: max(1, len(self.local) // 550)]
+        if depth_frame is not None:
+            eye = depth_frame["pose"]
+            world_to_camera = eye[:3, :3]
+            visible = (observed - eye[:3, 3]) @ world_to_camera
+            visible_mid = np.quantile(
+                visible[:, :2] / visible[:, 2:], [0.005, 0.995], axis=0
+            ).mean(0)
+
+        def center_silhouette(params):
+            if depth_frame is None:
+                return params
+            estimate = params.copy()
+            rot, offset = pose(estimate)
+            camera = (samples @ rot.T + offset - eye[:3, 3]) @ world_to_camera
+            normalized = camera[:, :2] / camera[:, 2:]
+            mid = np.quantile(normalized, [0.005, 0.995], axis=0).mean(0)
+            xy, z = normalized.mean(0), camera[:, 2].mean()
+            jac = (world_to_camera[:2, :2].T - xy[:, None] * world_to_camera[:2, 2]) / z
+            correction = np.linalg.lstsq(jac, visible_mid - mid, rcond=1e-6)[0]
+            estimate[:2] += np.clip(correction, -0.045, 0.045)
+            return estimate
+
+        def score_free_space(rotation, translation):
+            if depth_frame is None:
+                return 0.0
+            return free_space_error(samples @ rotation.T + translation, depth_frame)
+
         if prior is None:
             center = (np.quantile(points[:, :2], 0.01, axis=0) + np.quantile(points[:, :2], 0.99, axis=0)) / 2
             starts = [np.array([*center, a, 0.0, 0.0]) for a in np.arange(0, 2 * np.pi, np.pi / 4)]
-            coarse = sorted(starts, key=lambda p: np.mean(np.minimum(residual(p), 0.024)))[:4]
+            if depth_frame is not None:
+                starts += [center_silhouette(p) for p in starts]
+            coarse = sorted(starts, key=lambda p: np.mean(np.minimum(residual(p), 0.024)) + 2 * score_free_space(*pose(p)))[:4]
             bounds = ([*(center - 0.12), -2 * np.pi, -0.40, -0.40], [*(center + 0.12), 4 * np.pi, 0.40, 0.40])
             if rest_faces:
                 # A newly placed small object can roll onto a different face
@@ -97,9 +153,10 @@ class RegisteredSurface:
                         a = r.as_matrix()
                         xy = center - (np.quantile(self.local @ a.T, [.01,.99],axis=0).mean(0)[:2])
                         seed = np.r_[xy,r.as_euler("zyx")]
+                        seed = center_silhouette(seed)
                         rot,shift = pose(seed)
                         err = self.tree.query((points[::4]-shift) @ rot)[0]
-                        extra.append((float(np.mean(np.minimum(err,.016))), seed))
+                        extra.append((float(np.mean(np.minimum(err,.016))) + 2 * score_free_space(rot,shift), seed))
                     if len(chosen) >= 10:
                         break
                 extra.sort(key=lambda x:x[0])
@@ -122,7 +179,7 @@ class RegisteredSurface:
                 x_scale=[0.025, 0.025, 0.28, 0.15, 0.15],
             )
             errors = residual(opt.x)
-            score = float(np.mean(np.minimum(errors, 0.025)))
+            score = float(np.mean(np.minimum(errors, 0.025))) + 2 * score_free_space(*pose(opt.x))
             if best is None or score < best[0]:
                 best = (score, opt.x, errors)
         _, q, errors = best
@@ -166,10 +223,11 @@ class RegisteredSurface:
         self.table = table
 
     def clear(self, shapes, pose, margin):
-        for v in shapes.values():
+        for name, v in shapes.items():
             p = v @ pose[:3, :3].T + pose[:3, 3]
             low, high = p.min(0), p.max(0)
-            if low[2] < self.table + margin:
+            contact_allowed = getattr(self, "allow_hand_table_contact", False) and name.startswith(("right_", "left_"))
+            if not contact_allowed and low[2] < self.table + margin:
                 return False
             projection = None
             for vlo, vhi, plo, phi in self.bounds:

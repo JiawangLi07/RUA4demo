@@ -82,6 +82,14 @@ class PhysicsRecording:
             q[:, 0:1] * cross + torch.cross(q[:, 1:], cross, dim=1)
         )
         pieces.append(xyz[:, 2] + offset[:, 2])
+        if s.table_contact_view is not None:
+            table_load = (
+                s.table_contact_view.get_contact_force_matrix(s.config["physics_dt"])
+                .norm(dim=-1)
+                .sum(dim=1)
+            )
+            for side in self.sides:
+                pieces.append(table_load[self.links[side]])
         pieces.append(s.robot.data.joint_pos[0])
         self.pending.append(torch.cat(pieces))
         if len(self.pending) == 240:
@@ -122,6 +130,11 @@ class PhysicsRecording:
         for side in self.sides:
             fields[side + "_pad_center_z_m"] = rows[:, end : end + 5]
             end += 5
+        if self.scene.table_contact_view is not None:
+            for side in self.sides:
+                size = len(self.links[side])
+                fields[side + "_link_table_load_N"] = rows[:, end : end + size]
+                end += size
         if self.scene.fixture_path is not None:
             from .scene_wrist_mount import mount_parts
 

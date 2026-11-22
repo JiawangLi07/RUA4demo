@@ -51,6 +51,7 @@ def main():
         decision = decisions[code]
         hands = decision.get("attempt_hands") or [decision.get("hand", "right")]
         loads = {}
+        table_loads = {}
         for side in set(hands):
             link = z[side + "_link_names"].tolist().index(side + "_hand_C_MC")
             loads[side] = np.column_stack(
@@ -59,6 +60,8 @@ def main():
                     z[side + "_digit_load_N"][:, :, body],
                 )
             )
+            if side + "_link_table_load_N" in z:
+                table_loads[side] = z[side + "_link_table_load_N"].sum(axis=1)
         lower = 100 * (
             path_minimum(z["pose_wxyz"][:, body], points) - float(z["table_z"])
         )
@@ -164,7 +167,8 @@ def main():
             anchor="ra",
         )
         d.text((16, 555), "离线接触载荷", font=font, fill=(34, 53, 57))
-        d.text((16, 583), title, font=small, fill=(87, 99, 101))
+        detail = f"手与桌面 {table_loads[side][step]:.1f} N" if side in table_loads else title
+        d.text((16, 583), detail, font=small, fill=(87, 99, 101))
         for i, (label, force) in enumerate(zip(labels, load[step])):
             left = 174 + 182 * i
             color = (33, 104, 94) if force > 0.25 else (102, 110, 112)

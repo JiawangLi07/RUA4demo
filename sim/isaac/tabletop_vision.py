@@ -5,7 +5,7 @@ from scipy import ndimage
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 
-from .head_wrist_surface import RegisteredSurface
+from .head_wrist_surface import RegisteredSurface, free_space_error
 from .scene_meshes import load_mesh_bundle
 
 
@@ -165,13 +165,34 @@ class Models:
             if costs[i][j] < 2.0
         }
 
-    def fit(self, name, points, table, previous=None):
+    def fit(self, name, points, table, previous=None, *, depth_frame=None):
         surface = RegisteredSurface(self.bundles[name], sample_faces=True)
         if previous is not None:
             surface.fit = previous.fit.copy()
         span = np.ptp(surface.local, axis=0)
         low_body = span[2] < .075 or np.quantile(points[:, 2], .97) - table < .66*span[2]
-        info = surface.register(points, table, rest_faces=self.rest_faces and low_body)
+        rest_faces = self.rest_faces and low_body
+        try:
+            info = surface.register(points, table, rest_faces=rest_faces)
+        except ValueError:
+            if previous is not None or depth_frame is None:
+                raise
+            info = surface.register(points, table, rest_faces=rest_faces, depth_frame=depth_frame)
+        else:
+            if previous is None and depth_frame is not None:
+                # Only reconsider a good surface fit if it visibly occupies measured free space.
+                conflict = free_space_error(surface.world, depth_frame)
+                if conflict > 0.005:
+                    alternate = RegisteredSurface(self.bundles[name], sample_faces=True)
+                    try:
+                        alt_info = alternate.register(
+                            points, table, rest_faces=rest_faces, depth_frame=depth_frame
+                        )
+                    except ValueError:
+                        pass
+                    else:
+                        if free_space_error(alternate.world, depth_frame) + 0.001 < conflict:
+                            surface, info = alternate, alt_info
         pose = np.eye(4)
         pose[:3, :3] = info["pose_world_rotation"]
         pose[:3, 3] = info["pose_world_translation_m"]

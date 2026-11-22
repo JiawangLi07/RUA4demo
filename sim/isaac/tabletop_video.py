@@ -37,6 +37,11 @@ TARGETS = {
     "stepped_rod": "阶梯杆",
 }
 PHASES = {
+    "scene_placement_filter": "按这次摆位检查手臂路径",
+    "scene_native_request": "按头部网格计算本次抓姿",
+    "scene_native_result": "完成 Lightning Grasp 接触求解",
+    "clear_head_view": "侧移手掌，重新观察目标",
+    "compensate_probe_slip": "按试提中看到的跟手位移补足高度",
     "continue_visual_probe": "继续抬升，核对遮挡后的物体",
     "hand_reassignment": "另一只手重新规划",
     "mesh_section_search": "按头部网格寻找对握截面",

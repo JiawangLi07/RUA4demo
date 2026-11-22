@@ -178,6 +178,15 @@ class LightningBank:
                 data["source_id"] = (
                     z["source_id"] if "source_id" in z else np.arange(len(z["q"]))
                 )
+                if repo.get("method") == "live_scene_contact_refit":
+                    for key in (
+                        "arm_pre",
+                        "pre_in_palm",
+                        "q_open",
+                        "contact_pos",
+                        "contact_normal",
+                    ):
+                        data[key] = z[key]
                 if repo.get("method") in (
                     "reachable_placement_native_five_link_contact_ik",
                     "arm_chart_native_contact_field",
@@ -244,7 +253,9 @@ class LightningBank:
             for _, _, p in sorted(candidates, key=lambda x: x[0])[:5]
         ]
 
-    def select(self, ctrl, name, surface, reg, others, previous):
+    def select(
+        self, ctrl, name, surface, reg, others, previous, *, placement_limit=None
+    ):
         data, receipt = self.read(
             name,
             ctrl.library[name]["prior"]["sha256"],
@@ -252,7 +263,8 @@ class LightningBank:
             .get("lightning_input_sha256", {})
             .get(self.side),
         )
-        conditioned = "arm_pre" in data
+        guided = "arm_pre" in data
+        conditioned = "tight_in_palm" in data
         uniform = False
         if conditioned:
             low, high = np.quantile(surface.local[:, 2], [0.01, 0.99])
@@ -532,6 +544,14 @@ class LightningBank:
             closure_mode = "seated_wrap" if direct_seat else "power_wrap"
 
         choices = np.flatnonzero(eligible)
+        if getattr(ctrl, "allow_hand_table_contact", False):
+            # A light brush is admissible. A palm placement well through the rigid
+            # desk will deflect the wrist and miss the intended mesh contacts.
+            for row in choices:
+                lowest = (ctrl.shape(data["q"][row]) @ poses[row, 2, :3]).min() + poses[
+                    row, 2, 3
+                ]
+                score[row] -= 850 * max(0.0, ctrl.table - lowest - 0.001)
         order = choices[np.lexsort((-score[choices], -tier[choices]))]
         reached = []
         reach_trace = {}
@@ -542,6 +562,13 @@ class LightningBank:
             if approach_checks[tier[i]] >= 110 or not distinct(i):
                 continue
             palm, q = poses[i], data["q"][i].astype(float)
+            if placement_limit is not None and any(
+                np.linalg.norm(palm[:3, 3] - poses[j, :3, 3]) < 0.006
+                and np.trace(palm[:3, :3].T @ poses[j, :3, :3]) > 2.96
+                and np.linalg.norm(q - data["q"][j]) < 0.40
+                for _, j, *_ in reached
+            ):
+                continue
             if (
                 np.any(q < lo - 0.002)
                 or np.any(q > hi + 0.002)
@@ -559,7 +586,7 @@ class LightningBank:
             open_q[flex] = ctrl.open_hand[flex] + 0.23 * (
                 q[flex] - ctrl.open_hand[flex]
             )
-            if conditioned:
+            if guided:
                 open_q = data["q_open"][i]
             geometry = ctrl.link_shapes(open_q)
             toward_out = -palm[:3, 0]
@@ -571,7 +598,7 @@ class LightningBank:
                     (0.045, 0.040, 0.028),
                 )
             ]
-            if conditioned:
+            if guided:
                 pre_options = [palm @ data["pre_in_palm"][i]]
             pre_options = [
                 p
@@ -605,7 +632,7 @@ class LightningBank:
                         atlas[:, :3, 3] - pre[:3, 3], axis=1
                     ) + 0.10 * (3 - dot)
                     ik_seeds.extend(ctrl.bank.q[np.argsort(cost)[:4]])
-                if conditioned:
+                if guided:
                     ik_seeds.insert(0, data["arm_pre"][i])
                 for seed in ik_seeds:
                     stage = "pregrasp_ik"
@@ -645,12 +672,42 @@ class LightningBank:
                                 )
                         solved = None
                 if solved is not None:
+                    if placement_limit is not None:
+                        ctrl.hints[pre.round(5).tobytes()] = solved
+                        target, _, _ = seating(i)
+                        try:
+                            route = ctrl.move(
+                                pre,
+                                open_q,
+                                0.58,
+                                others,
+                                True,
+                                surface,
+                                object_margin=0.0005,
+                                plan_only=True,
+                                endpoint_check=lambda arm, grasp=palm, goal=target: (
+                                    ctrl.check_closure_path(
+                                        closure_mode, arm, grasp, goal
+                                    )
+                                ),
+                            )
+                            solved = route[-1]
+                        except NoPath:
+                            failures.setdefault("transit_path", {"count": 0})[
+                                "count"
+                            ] += 1
+                            continue
                     counts["arm_reachable"] += 1
                     effort = np.linalg.norm(solved - ctrl.arm)
                     reached.append((score[i] - 0.14 * effort, i, pre, open_q, solved))
                     break
-            if len(reached) >= 6:
+            if len(reached) >= (placement_limit or 6):
                 break
+        if placement_limit is not None:
+            ctrl.event(
+                "scene_placement_filter", **counts, reach_by_bank_row=reach_trace
+            )
+            return sorted(reached, key=lambda row: row[0], reverse=True)
         ctrl.event("lightning_filter", **counts, reach_by_bank_row=reach_trace)
         if not reached:
             if require_wrap:
@@ -718,6 +775,19 @@ class LightningBank:
             bank_input_sha256=receipt["input_sha256"],
         )
         knots = []
+        native_sites = []
+        if receipt.get("method") == "live_scene_contact_refit":
+            for j in np.flatnonzero(present[i]):
+                native_sites.append(
+                    dict(
+                        link=str(links[i, j]),
+                        anchor=data["contact_pos"][i, j],
+                        hand_normal=data["contact_normal"][i, j],
+                        goal=palm[:3, :3] @ data["target_pos"][i, j] + palm[:3, 3],
+                        normal=-palm[:3, :3] @ data["target_normal"][i, j],
+                        weight=1.2 if thumb[i, j] else 1.0,
+                    )
+                )
         if conditioned and "seated_q" in data and "contact_pos" in data:
             knots = seat_contact_knots(
                 ctrl,
@@ -730,6 +800,7 @@ class LightningBank:
                 data["target_pos"][i, present[i]],
             )
         return dict(
+            native_sites=native_sites,
             seating_knots=knots,
             explicit_digits=digits[i].tolist(),
             closure_mode=closure_mode,

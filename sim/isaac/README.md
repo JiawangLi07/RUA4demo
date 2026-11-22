@@ -223,3 +223,25 @@ common=(--scene "$SCENE" --library "$REGISTRY" --hands "$HAND" --target "$OBJECT
 The exporter accepts an existing arm chart through `--placement-chart DIR` and rechecks it in the current observation. When native contact priors already exist for the same mesh, `--contact-priors DIR` initializes additional surface-reprojected finger solves. The arm domain and the native bank include input hashes and row identities. The executor registers a fresh head frame, checks the selected trajectory again, and keeps failure and retry frames in the recording. Each `lightning_filter` event lists failure stages per candidate and IK branch. `open_approach` counts collision-clear open-hand placements. `arm_reachable` counts placements with a verified motion through lift.
 
 Native camera frames preserve simulation time at 15 fps. To create the continuous two-camera video, run `python -m sim.isaac.tabletop_video --run "$RUN" --speed 1 --out "$VIDEO"`. For an observer close-up with time-aligned digit and palm loads, use `python -m sim.isaac.tabletop_contact_video --run "$RUN" --target "$TARGET" --crop X Y SIZE --out "$VIDEO"`. The crop is in observer-image pixels and the full frame remains visible alongside it.
+
+### Small native batches in a live tabletop scene
+
+Use `--scene-candidates 4` for an episode with head RGB-D and `--adaptive-grasps`. The controller registers the observed object, checks the current arm's transit, closure and lift paths, and writes up to four contact queries per target and hand. The queries use native contact priors for the metric mesh and, when room remains, hand initializations fitted to the observed cross section. The CUDA process reprojects sites on the exact metric mesh and refines the joints with Lightning Grasp. It checks the complete hand against the object and itself, including unconstrained fingers. The controller consumes the returned rows in the same live scene. Local retries reuse that episode's budget.
+
+Start the solver in the Lightning Grasp environment and the episode in the Isaac environment. They can share a filesystem. For separate machines, copy each completed `request.npz` to the same relative directory under the solver queue, then return the resulting NPZ before `result.json`. The request, input mesh, hand and candidate bank have checksums. The experiment package contains a working two-host example.
+
+```bash
+"$LIGHTNING_PY" -m sim.isaac.tabletop_scene_solver --upstream "$LIGHTNING_REPO" --hand "$SHARPA_URDF" \
+  --meshes "$METRIC_PLY" --priors "$NATIVE_PRIORS" --queue "$RUN/scene_generation"
+```
+
+```bash
+"$ISAAC_PY" -m sim.isaac.tabletop_native --scene "$SCENE" --library "$REGISTRY" --target "$TARGET" \
+  --out "$RUN" --hands "$SIDE" --camera-mode head --wrist-hardware removed --adaptive-grasps \
+  --lightning-candidates "$NATIVE_PRIORS" --scene-candidates 4 --allow-hand-table-contact \
+  --lift-height-m 0.05 --headless
+```
+
+The registry locates the shared Sharpa posture file. The optional table-contact flag admits planned finger and palm contact with the physically simulated desk. Object, neighbor, forearm and flange checks remain active. The independent recorder stores measured link-to-table normal loads in `physics_audit.npz`. Use the contact close-up to inspect them alongside the object's lowest point. The online controller uses head depth, known metric mesh geometry and issued joint targets.
+
+With hand contact enabled, the initial head registration compares the projected metric surface with measured depth. A second silhouette-assisted fit is used when the first fit occupies observed free space and the alternative reduces the depth error. During closure the controller reobserves the object before applying pressure toward the native contact sites. During a short test lift, measured visual following can add up to 16 mm of wrist travel to account for movement lost before the object follows. The 5 cm target is evaluated on the object's motion and lowest point throughout the final hold.

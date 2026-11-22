@@ -76,6 +76,11 @@ def main():
         help="use head depth and arm IK to prepare fixed placements for the native contact solver",
     )
     parser.add_argument("--observe-only", action="store_true")
+    parser.add_argument(
+        "--allow-hand-table-contact",
+        action="store_true",
+        help="allow Sharpa links to touch the physical table during head-only grasp planning",
+    )
     parser.add_argument("--camera-mode", choices=("head", "head-wrist"), default="head")
     parser.add_argument(
         "--wrist-hardware",
@@ -87,6 +92,12 @@ def main():
         "--lightning-candidates",
         type=Path,
         help="directory of native Sharpa Lightning Grasp banks",
+    )
+    parser.add_argument(
+        "--scene-candidates",
+        type=int,
+        choices=range(1, 5),
+        help="request at most this many fresh native contact solves per target and hand in this episode",
     )
     parser.add_argument(
         "--wrist-mount", type=Path, help="registered 002.3dm fixture bundle"
@@ -109,6 +120,20 @@ def main():
     )
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
+    if args.allow_hand_table_contact and args.camera_mode != "head":
+        parser.error("--allow-hand-table-contact requires head-only planning")
+    if args.scene_candidates and (
+        not args.adaptive_grasps
+        or args.observe_only
+        or args.export_lightning_placements
+        or args.mesh_grasps
+        or args.template_comparison
+        or args.hybrid_grasps
+        or args.camera_mode != "head"
+    ):
+        parser.error(
+            "--scene-candidates requires a head-only adaptive Lightning grasp trial"
+        )
     if args.placement_chart and not args.export_lightning_placements:
         parser.error("--placement-chart requires --export-lightning-placements")
     if args.export_lightning_placements and (
@@ -157,6 +182,7 @@ def main():
         config = json.loads(args.scene.read_bytes())
         config["active_hands"] = args.hands
         config["check_forearm_table"] = args.adaptive_grasps
+        config["record_hand_table_contact"] = args.allow_hand_table_contact
         config["camera_mode"] = args.camera_mode
         config["wrist_hardware"] = hardware
         if args.wrist_mount:
@@ -180,7 +206,8 @@ def main():
                 spec, shared = load_registry(
                     args.library,
                     args.template_comparison,
-                    load_postures=solver != "lightning_grasp",
+                    load_postures=solver != "lightning_grasp"
+                    or bool(args.scene_candidates),
                 )
                 if (
                     solver in ("adaptive_mesh", "adaptive_mesh_and_lightning")
@@ -200,6 +227,8 @@ def main():
                             "camera_mode": args.camera_mode,
                             "wrist_hardware": hardware,
                             "solver": solver,
+                            "scene_candidate_limit": args.scene_candidates,
+                            "allow_hand_table_contact": args.allow_hand_table_contact,
                             "adaptive_grasps": args.adaptive_grasps,
                             "mount_installed": scene.fixture_path is not None,
                         }
@@ -209,6 +238,15 @@ def main():
                 for i, side in enumerate(sides):
                     device = io if i == 0 else connect(scene, out, side, audit)[0]
                     bank = LightningBank(bank_path, side) if bank_path else None
+                    if args.scene_candidates:
+                        from .tabletop_scene_refit import LiveSceneBank
+
+                        bank = LiveSceneBank(
+                            bank_path,
+                            side,
+                            out / "scene_generation",
+                            args.scene_candidates,
+                        )
                     if args.export_lightning_placements:
                         from .tabletop_lightning_reach import PlacementExport
 
@@ -228,6 +266,7 @@ def main():
                             bank,
                             args.adaptive_grasps,
                             hybrid_grasps=args.hybrid_grasps,
+                            allow_hand_table_contact=args.allow_hand_table_contact,
                         )
                     )
                 targets = list(args.target or spec)

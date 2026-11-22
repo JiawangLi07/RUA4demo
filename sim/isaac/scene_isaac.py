@@ -299,6 +299,15 @@ class NativeBimanualScene:
         watched = [config["robot_prim"] + "/" + name for name in self.body_ids]
         filters = list(config["object_prims"].values())
         self.contact_view = self.tensor_view.create_rigid_contact_view(watched, [filters] * len(watched), 32768)
+        self.table_contact_view = None
+        if config.get("record_hand_table_contact"):
+            table_shapes = [str(p.GetPath()) for p in Usd.PrimRange(stage.GetPrimAtPath(config["table_prim"]))
+                            if p.HasAPI(UsdPhysics.CollisionAPI)]
+            if not table_shapes:
+                raise ValueError("physical tabletop collider missing")
+            self.table_contact_view = self.tensor_view.create_rigid_contact_view(
+                watched, [table_shapes] * len(watched), 32768
+            )
         self.contact_names = list(self.body_ids)
         self.contact_filters = list(config["object_prims"])
         self.time, self.frame_number, self.step_number = 0.0, 0, 0
