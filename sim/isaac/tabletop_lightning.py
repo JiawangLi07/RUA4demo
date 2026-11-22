@@ -35,6 +35,15 @@ def central_palm_samples(vertices):
     return patch[:: max(1, len(patch) // 120)]
 
 
+def requires_full_wrap(points):
+    """Long bodies with two broad transverse dimensions can span the four fingers."""
+    centered = points - np.mean(points, axis=0)
+    _, basis = np.linalg.eigh(centered.T @ centered)
+    lower, upper = np.quantile(centered @ basis, [0.005, 0.995], axis=0)
+    narrow, wide, length = np.sort(upper - lower)
+    return bool(narrow >= 0.042 and length >= max(0.090, 2 * wide))
+
+
 class LightningBank:
     def __init__(self, path, side):
         self.path, self.side = Path(path), side
@@ -182,7 +191,10 @@ class LightningBank:
         )
         # A tall body with room for the four-finger span can accept a power grasp.
         span = np.ptp(surface.local, axis=0)
-        power_body = span[2] >= 0.090 and np.min(span[:2]) >= 0.042
+        require_wrap = not getattr(ctrl, "hybrid_grasps", False) and requires_full_wrap(
+            surface.local
+        )
+        power_body = require_wrap or (span[2] >= 0.090 and np.min(span[:2]) >= 0.042)
         park_rot = ctrl.ik.fk(ctrl.reference_arm)[:3, :3]
         trace = np.einsum("nij,ij->n", poses[:, :3, :3], park_rot)
         turn = np.arccos(np.clip((trace - 1) / 2, -1, 1))
@@ -261,14 +273,17 @@ class LightningBank:
                             supported[i, j] = True
                             break
         eligible &= digits.sum(1) >= (2 if adaptive else 3)
-        # Prefer a full wrap whenever the arm can execute it. Narrow surfaces
-        # and obstructed approaches can still support an upright opposed grip.
+        # A native finger solution and a nearby palm patch are both required for
+        # an enveloping grasp. Other shapes can use an opposed multi-digit grip.
         tier = np.ones(len(poses), dtype=int)
         if power_body:
             close_palm = palm_gap <= 0.012
             tier[close_palm & (supported.sum(1) >= 4)] = 2
             tier[close_palm & supported.all(1)] = 3
         counts["nominal_full_wrap"] = int(np.count_nonzero(eligible & (tier == 3)))
+        counts["full_wrap_required"] = require_wrap
+        if require_wrap:
+            eligible &= (tier == 3) & (palm_gap <= 0.005)
         counts["contact_geometry"] = int(eligible.sum())
         excluded = {int(s.split("-")[-1]) for s in previous if s.startswith("LG-")}
 
@@ -285,6 +300,17 @@ class LightningBank:
         flex = np.array(
             [n.endswith(("_FE", "_IP", "_PIP", "_DIP")) for n in RIGHT_JOINTS]
         )
+
+        def seating(i):
+            tight = data["q"][i].astype(float)
+            tight[flex] = np.clip(tight[flex] + 0.15, lo[flex], hi[flex])
+            depth = (
+                min(float(palm_gap[i]) + 0.0015, 0.005)
+                if power_body and palm_gap[i] <= 0.012
+                else 0.0
+            )
+            return shifted(poses[i], depth * poses[i, :3, 0]), tight, depth
+
         choices = np.flatnonzero(eligible)
         order = choices[np.lexsort((-score[choices], -tier[choices]))]
         reached = []
@@ -302,6 +328,11 @@ class LightningBank:
                 or (fixture and not surface.clear(fixture, palm, 0.001))
             ):
                 continue
+            closure_goal = palm
+            if require_wrap:
+                closure_goal, tight_q, _ = seating(i)
+                if not ctrl.clear(closure_goal, tight_q, others):
+                    continue
             counts["hand_clear"] += 1
             open_q = q.copy()
             open_q[flex] = ctrl.open_hand[flex] + 0.23 * (
@@ -350,9 +381,9 @@ class LightningBank:
                 for seed in ik_seeds:
                     try:
                         solved = ctrl.ik.solve(pre, seed)
-                        if getattr(ctrl, "adaptive", False):
+                        if require_wrap or getattr(ctrl, "adaptive", False):
                             ctrl.check_closure_path(
-                                "lightning_grasp", solved, palm, palm
+                                "lightning_grasp", solved, palm, closure_goal
                             )
                         else:
                             ctrl.lightning_lift_ik(palm, solved)
@@ -368,22 +399,19 @@ class LightningBank:
                 break
         ctrl.event("lightning_filter", **counts)
         if not reached:
+            if require_wrap:
+                raise NoPath(
+                    "Lightning Grasp has no executable four-finger and central-palm wrap"
+                )
             raise NoPath("Lightning Grasp has no reachable collision-clear candidate")
         _, i, pre, open_q, solved = max(reached, key=lambda item: item[0])
         palm, q = poses[i], data["q"][i].astype(float)
-        tight = q.copy()
-        tight[flex] = np.clip(q[flex] + 0.15, lo[flex], hi[flex])
         posture = f"LG-{i}"
         ctrl.hints[pre.round(5).tobytes()] = solved
         # The native pose is the initial contact target. Use a separate, bounded
         # seating command along the measured palm normal to take up surface clearance.
-        seat_depth = (
-            min(float(palm_gap[i]) + 0.0015, 0.005)
-            if power_body and palm_gap[i] <= 0.012
-            else 0.0
-        )
-        seated = shifted(palm, seat_depth * palm[:3, 0])
-        if not ctrl.clear(seated, tight, others):
+        seated, tight, seat_depth = seating(i)
+        if not require_wrap and not ctrl.clear(seated, tight, others):
             seated, seat_depth = palm, 0.0
         identity = {
             "bank_sha256": receipt["bank_sha256"],
@@ -408,6 +436,7 @@ class LightningBank:
             wrist_to_knuckles_world_z=float(palm[2, 2]),
             turn_from_park_deg=float(np.rad2deg(turn[i])),
             central_palm_gap_m=float(palm_gap[i]),
+            full_wrap_required=require_wrap,
             palm_seat_m=seat_depth,
             contact_tier=("multi_digit", "palm_and_three", "palm_and_four")[
                 tier[i] - 1

@@ -6,7 +6,11 @@ import pytest
 
 from sim.isaac.paths import RIGHT_JOINTS
 from sim.isaac.tabletop_control import Controller, NoPath
-from sim.isaac.tabletop_lightning import LightningBank, central_palm_samples
+from sim.isaac.tabletop_lightning import (
+    LightningBank,
+    central_palm_samples,
+    requires_full_wrap,
+)
 from sim.isaac.tabletop_lightning_banks import merge
 
 
@@ -196,6 +200,68 @@ def test_palm_gap_samples_exclude_back_and_flange():
     assert np.allclose(samples[:, 0], 0.011)
     assert np.max(np.abs(samples[:, 1])) < 0.024
     assert samples[:, 2].min() > 0.030 and samples[:, 2].max() < 0.082
+
+
+def test_long_grip_span_is_independent_of_table_orientation():
+    from scipy.spatial.transform import Rotation
+
+    angle = np.arange(64) * 2 * np.pi / 64
+    ring = np.c_[0.032 * np.cos(angle), 0.032 * np.sin(angle)]
+    body = np.vstack([np.c_[ring, np.full(len(angle), z)] for z in (-0.08, 0.08)])
+    rot = Rotation.from_euler("xyz", [23, 58, 74], degrees=True).as_matrix()
+    assert requires_full_wrap(body @ rot.T)
+    assert not requires_full_wrap(body * [1, 1, 0.42])
+    assert not requires_full_wrap(body * [0.3, 0.3, 1])
+
+
+@pytest.mark.parametrize("gap", [0.008, 0.072])
+def test_long_body_cannot_close_a_native_pinch_with_a_distant_palm(gap):
+    from scipy.spatial.transform import Rotation
+
+    palm = np.eye(4)
+    palm[:3, :3] = Rotation.from_euler("x", 65, degrees=True).as_matrix()
+    pads = np.zeros((1, 5, 3))
+    pads[0, 0, 1] = 0.024
+    names = np.array(
+        [f"right_{d}_elastomer" for d in ("thumb", "index", "middle", "ring", "pinky")]
+    )
+    data = {
+        "object_pose": np.linalg.inv(palm)[None],
+        "q": np.zeros((1, 22)),
+        "contact_link_id": np.arange(5)[None],
+        "link_names": names,
+        "target_pos": np.zeros_like(pads),
+        "target_normal": np.zeros_like(pads),
+        "pad_centers": pads,
+        "palm_gaps": np.array([gap]),
+    }
+    bank = LightningBank(".", "right")
+    bank.read = lambda *args: (data, {})
+    events = []
+    ctrl = SimpleNamespace(
+        library={"item": {"prior": {"sha256": "id"}}},
+        adaptive=True,
+        ik=SimpleNamespace(fk=lambda _: np.eye(4)),
+        reference_arm=np.zeros(7),
+        io=SimpleNamespace(
+            model=SimpleNamespace(limits={"right": np.tile([-2, 2], (22, 1))})
+        ),
+        clear=lambda *args: pytest.fail(
+            "rejected candidate reached execution planning"
+        ),
+        event=lambda phase, **info: events.append(info),
+    )
+    points = np.array(
+        [
+            [x, y, z]
+            for x in (-0.03, 0.03)
+            for y in (-0.03, 0.03)
+            for z in (-0.085, 0.085)
+        ]
+    )
+    with pytest.raises(NoPath, match="four-finger and central-palm"):
+        bank.select(ctrl, "item", SimpleNamespace(local=points), np.eye(4), None, [])
+    assert events[-1]["full_wrap_required"] and events[-1]["contact_geometry"] == 0
 
 
 def test_static_palm_contact_joins_native_contact_search_in_object_frame():
