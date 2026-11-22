@@ -211,3 +211,24 @@ def test_probe_detects_rotation_about_table_before_accepting_rgbd_pixel_votes(
         ctrl.vote(skin, np.eye(4), np.eye(4), [], "test_observation_repeat")
         == "carried"
     )
+
+
+def test_visual_interruption_resumes_from_last_issued_joints():
+    ctrl = Controller.__new__(Controller)
+    commands = []
+    ctrl.io = SimpleNamespace(
+        dt=0.01,
+        model=SimpleNamespace(limits={"right": np.array([[-1, 1]])}),
+        step=lambda arm, hand: commands.append((arm.copy(), hand.copy())),
+    )
+    ctrl.adaptive, ctrl.lightning, ctrl.table = False, None, None
+    ctrl.arm, ctrl.hand = np.zeros(1), np.zeros(1)
+    ctrl.command(
+        [ctrl.arm, np.array([0.15])], np.array([0.8]), 0.65, observe=lambda f: True
+    )
+    np.testing.assert_array_equal(ctrl.arm, commands[-1][0])
+    np.testing.assert_array_equal(ctrl.hand, commands[-1][1])
+    assert 0 < ctrl.hand[0] < 0.8 and 0 < ctrl.arm[0] < 0.15
+    ctrl.command([ctrl.arm, np.array([0.20])], np.array([0.7]), 0.20)
+    np.testing.assert_allclose(ctrl.arm, [0.20])
+    np.testing.assert_allclose(ctrl.hand, [0.7])

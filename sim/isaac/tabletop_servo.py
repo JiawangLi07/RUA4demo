@@ -164,3 +164,62 @@ def opposed_touch(ctrl, surface, pose, sites, palm, native_q):
         links=[s["link"] for s in sites],
     )
     return surface, pose, shift
+
+
+def follow_during_closure(ctrl, surface, pose, sites, palm, tight, q, others):
+    """Follow a displaced long object while the native contacts can still be recovered."""
+    from .tabletop_opposition import LowerEdge, long_horizontal_axis
+
+    if long_horizontal_axis(surface.world) is None:
+        ctrl.closing(palm, q, 0.65)
+        return surface, pose, palm, tight
+
+    correction = None
+
+    def observe(fraction):
+        nonlocal correction
+        updated, reg = reobserve(
+            ctrl, surface, pose, tag=f"closing_{int(fraction * 100)}"
+        )
+        displacement = float(np.linalg.norm(reg[:2, 3] - pose[:2, 3]))
+        turn = float(
+            np.rad2deg(Rotation.from_matrix(reg[:3, :3] @ pose[:3, :3].T).magnitude())
+        )
+        ctrl.event(
+            "closing_displacement",
+            fraction=fraction,
+            registered=updated is not surface,
+            move_m=displacement,
+            rotation_deg=turn,
+        )
+        if (
+            updated is surface
+            or displacement < 0.005
+            or (displacement < 0.008 and turn < 7)
+        ):
+            return False
+        correction = updated, reg, displacement, turn
+        return True
+
+    ctrl.closing(palm, q, 0.65, observe=observe)
+    if correction is None:
+        return surface, pose, palm, tight
+    updated, reg, displacement, turn = correction
+    if displacement > 0.019 or turn > 24:
+        raise NoPath("target moved outside the current opposed contacts during closure")
+    transform = reg @ np.linalg.inv(pose)
+    new_palm, new_tight = transform @ palm, transform @ tight
+    if not ctrl.clear(new_palm, ctrl.hand, others) or not ctrl.clear(
+        new_palm, q, others
+    ):
+        raise NoPath("shifted contact frame has no clear local continuation")
+    guard = LowerEdge(updated, ctrl.table)
+    if ctrl.lower_guard is not None:
+        guard.used.update(ctrl.lower_guard.used)
+    ctrl.lower_guard = guard
+    ctrl.check_closure_path("lightning_grasp", ctrl.arm, new_palm, new_tight)
+    ctrl.closing(new_palm, ctrl.hand, 0.24)
+    ctrl.closing(new_palm, q, 0.37)
+    move_native_sites(sites, pose, reg)
+    ctrl.event("follow_during_closure", displacement_m=displacement, rotation_deg=turn)
+    return updated, reg, new_palm, new_tight

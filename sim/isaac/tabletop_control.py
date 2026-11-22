@@ -392,8 +392,8 @@ class Controller:
         # along Cartesian and fallback joint-space paths, including local retries.
         return bool(palm[2, 1] >= -0.055 and palm[2, 2] >= -0.20)
 
-    def command(self, joints, hand, duration):
-        """Interpolate the planned joint path by arc length and keep the final hand target."""
+    def command(self, joints, hand, duration, observe=None):
+        """Interpolate the joint path, or stop at the issued command on a visual correction."""
         io = self.io
         start = self.hand.copy()
         hand = np.clip(hand, *io.model.limits["right"].T)
@@ -426,6 +426,7 @@ class Controller:
         # Leave tracking headroom below the arm drive's approximately 3.14 rad/s limit.
         duration = max(duration, 1.5 * arc[-1] / (0.84 * 2.25))
         ticks = max(2, round(duration / io.dt))
+        sample_at = {round(ticks * t) for t in (0.29, 0.44, 0.65)} if observe else set()
         for i in range(1, ticks + 1):
             f = min(1.0, i / (0.84 * ticks))
             f = f * f * (3 - 2 * f)
@@ -433,7 +434,14 @@ class Controller:
             k = min(np.searchsorted(arc, distance, side="right") - 1, len(arc) - 2)
             blend = (distance - arc[k]) / max(arc[k + 1] - arc[k], 1e-12)
             arm = joints[k] + blend * (joints[k + 1] - joints[k])
-            io.step(arm, start + f * (hand - start))
+            drive = start + f * (hand - start)
+            io.step(arm, drive)
+            if i in sample_at and observe(i / ticks):
+                self.arm, self.hand = arm.copy(), drive.copy()
+                if guard is not None:
+                    prefix = np.vstack((joints[: k + 1], arm))
+                    guard.used.update(guard.sweep(self, prefix, start, drive))
+                return
         self.arm, self.hand = joints[-1].copy(), hand.copy()
         if guard is not None:
             guard.used.update(lower)
@@ -1409,7 +1417,11 @@ class Controller:
                 if not verified:
                     seat = shifted(grasp, -0.009 * grasp[:3, 0])
                     self.closing(seat, qo, 0.48)
-                from .tabletop_servo import move_native_sites, opposed_touch
+                from .tabletop_servo import (
+                    follow_during_closure,
+                    move_native_sites,
+                    opposed_touch,
+                )
 
                 sites = seed.get("native_sites", [])
                 geometry = seed["lightning_candidate"]
@@ -1424,6 +1436,10 @@ class Controller:
                         self, surface, pose, sites, grasp, qt
                     )
                     tight = shifted(tight, correction)
+                elif verified and sites:
+                    surface, pose, grasp, tight = follow_during_closure(
+                        self, surface, pose, sites, grasp, tight, qt, others
+                    )
                 else:
                     self.closing(grasp, qt, 0.65)
                 self.closing(tight, qc, 0.42)
@@ -1824,12 +1840,12 @@ class Controller:
                         pass
                     self.event("local_withdraw")
 
-    def closing(self, goal, hand, seconds):
+    def closing(self, goal, hand, seconds, observe=None):
         start = self.arm.copy()
         target = self.ik.solve(goal, start)
         if self.seat_trim is not None:
             target = np.clip(target + self.seat_trim, *self.ik.bounds)
-        self.command([start, target], hand, seconds)
+        self.command([start, target], hand, seconds, observe=observe)
 
     def execute(self, targets=None, finish=True):
         (self.out / "observations").mkdir(exist_ok=True)
