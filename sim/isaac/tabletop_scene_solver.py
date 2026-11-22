@@ -15,9 +15,39 @@ from scipy.spatial import cKDTree
 
 from .tabletop_lightning_generate import native_collision_mask, prepare
 
+MAX_SURFACE_GAP_M = 0.009
+MIN_NORMAL_DOT = 0.35
+NORMAL_COST_M = 0.005
+
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def match_surface_patches(tree, normals, sites, outward):
+    """Match each contact to a nearby patch with the requested outward normal."""
+    distances, indices = tree.query(sites, k=min(24, tree.n))
+    dots = (normals[indices] * outward[:, None]).sum(-1)
+    choice = np.argmin(distances + NORMAL_COST_M * (1 - dots), axis=1)
+    rows = np.arange(len(sites))
+    matched = indices[rows, choice]
+    gaps = distances[rows, choice]
+    alignment = dots[rows, choice]
+    recovered = 0
+    # On a dense mesh the nearest 24 vertices may all lie on the back of a
+    # thin wall. Search the full physical tolerance before rejecting a site.
+    for i in np.flatnonzero((gaps > MAX_SURFACE_GAP_M) | (alignment < MIN_NORMAL_DOT)):
+        near = np.asarray(tree.query_ball_point(sites[i], MAX_SURFACE_GAP_M), dtype=int)
+        patch_dot = normals[near] @ outward[i]
+        compatible = patch_dot >= MIN_NORMAL_DOT
+        if not compatible.any():
+            continue
+        near, patch_dot = near[compatible], patch_dot[compatible]
+        gap = np.linalg.norm(tree.data[near] - sites[i], axis=1)
+        k = np.argmin(gap + NORMAL_COST_M * (1 - patch_dot))
+        matched[i], gaps[i], alignment[i] = near[k], gap[k], patch_dot[k]
+        recovered += 1
+    return matched, gaps, alignment, recovered
 
 
 def solve_request(folder, args, ctx, api, torch):
@@ -80,18 +110,17 @@ def solve_request(folder, args, ctx, api, torch):
         # Their new object-surface targets follow the proposed wrist and the head scan.
         pred = (warm["target_pos"][idx, active] - pose[:3, 3]) @ pose[:3, :3]
         outward = -warm["target_normal"][idx, active] @ pose[:3, :3]
-        dist, ix = tree.query(pred, k=min(24, len(verts)))
-        dot = (normals[ix] * outward[:, None]).sum(-1)
-        choice = np.argmin(dist + 0.005 * (1 - dot), axis=1)
-        ii = np.arange(len(active))
-        near, alignment = ix[ii, choice], dot[ii, choice]
+        near, gaps, alignment, recovered = match_surface_patches(
+            tree, normals, pred, outward
+        )
         row = {
             "parent": int(parent_id),
-            "surface_gap_m": float(dist[ii, choice].max()),
+            "surface_gap_m": float(gaps.max()),
             "min_normal_dot": float(alignment.min()),
+            "radius_recovered_sites": recovered,
         }
         rows.append(row)
-        if row["surface_gap_m"] > 0.009 or alignment.min() < 0.35:
+        if gaps.max() > MAX_SURFACE_GAP_M or alignment.min() < MIN_NORMAL_DOT:
             row["stage"] = "surface_projection"
             continue
         # Contact sites from the parent already lie on its triangles. Retain
