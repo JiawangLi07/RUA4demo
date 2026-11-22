@@ -199,10 +199,11 @@ class Models:
         return surface, pose, info
 
 
-def add_live_samples(surface, head, wrist):
+def add_live_samples(surface, primary, wrist, primary_role="head"):
     """Retain real camera samples for surface targets and for local handle cross sections."""
     surface.camera_samples = {}
-    for name, cloud in (("head_depth", head), ("wrist_depth", wrist)):
+    surface.primary_depth = primary_role + "_depth"
+    for name, cloud in ((surface.primary_depth, primary), ("wrist_depth", wrist)):
         if not len(cloud):
             continue
         unique = np.unique(

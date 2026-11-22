@@ -147,7 +147,8 @@ def reobserve(controller, surface, pose, tag="handle_seated"):
                 )
                 from .tabletop_vision import add_live_samples
 
-                add_live_samples(new, live.get("head", []), live.get("wrist", []))
+                primary = controller.camera_roles[0]
+                add_live_samples(new, live.get(primary, []), live.get("wrist", []), primary)
                 new.allow_hand_table_contact = getattr(surface, "allow_hand_table_contact", False)
                 return new, reg
         except ValueError:

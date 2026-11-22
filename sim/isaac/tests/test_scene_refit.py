@@ -3,6 +3,7 @@ import json
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from scipy.spatial import cKDTree
 
 from sim.isaac import tabletop_scene_refit
@@ -29,7 +30,8 @@ def test_admit_hand_contact_preserves_fixture_and_neighbor_clearance():
     assert not ctrl.vertices_clear(pose, hand, cKDTree(hand))
 
 
-def test_one_head_request_and_same_response_on_a_retry(tmp_path, monkeypatch):
+@pytest.mark.parametrize("sensor", ["head", "left_observer"])
+def test_one_view_request_and_same_response_on_a_retry(tmp_path, monkeypatch, sensor):
     # The live episode stays at the observation timestamp while the external
     # worker answers, then retries address rows in the exact same bank.
     priors = tmp_path / "priors"
@@ -68,8 +70,11 @@ def test_one_head_request_and_same_response_on_a_retry(tmp_path, monkeypatch):
         return bank.path, previous
 
     monkeypatch.setattr(tabletop_scene_refit.LightningBank, "select", select)
-    surface = SimpleNamespace(camera_samples={})
+    measured = np.array([[0.53, -0.23, 0.8], [0.55, -0.21, 0.81]])
+    surface = SimpleNamespace(camera_samples={sensor + "_depth": measured}, primary_depth=sensor + "_depth")
     ctrl = SimpleNamespace(
+        camera_roles=(sensor,),
+        sampling_seed=751 if sensor == "left_observer" else None,
         library={
             "part": {
                 "prior": {"sha256": "geom", "lightning_input_sha256": {"right": "mesh"}}
@@ -84,6 +89,14 @@ def test_one_head_request_and_same_response_on_a_retry(tmp_path, monkeypatch):
 
     def answer(_):
         with np.load(folder / "request.npz") as request:
+            if sensor == "left_observer":
+                assert "head_local" not in request
+                assert (
+                    json.loads(str(request["receipt"]))["observation_source"] == sensor
+                )
+                np.testing.assert_allclose(request["observed_local"], measured)
+            else:
+                np.testing.assert_allclose(request["head_local"], measured)
             assert len(request["parent"]) == 2
             np.testing.assert_array_equal(request["parent"], [0, 1])
         response = folder / "part.right.npz"

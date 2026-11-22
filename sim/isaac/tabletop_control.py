@@ -193,6 +193,7 @@ class Controller:
         self.open_hand = self.hand.copy()
         self.seen = {}
         self.camera_roles = getattr(io, "camera_roles", ("head", "wrist"))
+        self.sampling_seed = getattr(io, "paired_scene_seed", None)
         self.eye_from_palm = (
             None if io.palm_from_wrist is None else np.linalg.inv(io.palm_from_wrist)
         )
@@ -223,7 +224,7 @@ class Controller:
         return frame
 
     def survey(self, wrist=False):
-        frame = self.snapshot("wrist" if wrist else "head", "survey")
+        frame = self.snapshot("wrist" if wrist else self.camera_roles[0], "survey")
         if not wrist:
             self.survey_frame = frame
         self.table, pieces = proposals(frame, self.io, self.table)
@@ -249,6 +250,22 @@ class Controller:
             )
             self.head_pieces = pieces
             self.seen = self.models.identify(pieces)
+            if self.sampling_seed is not None:
+                folder = self.out / "point_clouds"
+                folder.mkdir(exist_ok=True)
+                for name, part in self.seen.items():
+                    path = folder / f"{name}.npz"
+                    if not path.exists():
+                        np.savez_compressed(
+                            path,
+                            xyz=part["xyz"],
+                            rgb=part["rgb"],
+                            uv=part["uv"],
+                            sensor=frame["sensor"],
+                            time=frame["time"],
+                            K=frame["K"],
+                            pose=frame["pose"],
+                        )
         else:
             # Merge two camera views by footprint proximity in world coordinates, then reassign globally.
             combined = [dict(p) for p in self.head_pieces]
@@ -275,7 +292,7 @@ class Controller:
                     combined.append(item)
             self.seen = self.models.identify(combined)
         self.event(
-            "survey_wrist" if wrist else "survey_head",
+            "survey_wrist" if wrist else "survey_" + self.camera_roles[0],
             objects={
                 n: {"xyz": p["center"].tolist(), "cost": round(p["match_cost"], 3)}
                 for n, p in self.seen.items()
@@ -771,7 +788,7 @@ class Controller:
                 else None,
             )
             self.event(
-                "registered_head",
+                "registered_" + self.camera_roles[0],
                 points=len(observed["xyz"]),
                 median_m=fit["median_residual_m"],
                 p90_m=fit["p90_residual_m"],
@@ -793,7 +810,7 @@ class Controller:
             surface.world = rotated + pose[:3, 3]
             surface.table = self.table
             self.event(
-                "coarse_head_roi", center=observed["center"].tolist(), points=len(obs)
+                f"coarse_{self.camera_roles[0]}_roi", center=observed["center"].tolist(), points=len(obs)
             )
             return surface, pose, False
 
@@ -899,11 +916,11 @@ class Controller:
         others = cKDTree(cloud)
         if "wrist" not in self.camera_roles:
             if not accurate:
-                raise NoPath("head mesh registration unconfirmed")
+                raise NoPath(f"{self.camera_roles[0]} mesh registration unconfirmed")
             from .tabletop_views import ViewBank
             from .tabletop_vision import add_live_samples
 
-            add_live_samples(surface, target, [])
+            add_live_samples(surface, target, [], self.camera_roles[0])
             if self.bank is None:
                 # Only robot FK and the joint-space roadmap are used in this mode.
                 self.bank = ViewBank(
@@ -918,7 +935,7 @@ class Controller:
                     else (geometry_family(surface), self.library[name]["seeds"])
                 )
             self.event(
-                "head_only_grasp", points=len(target), mesh_to_world=pose.tolist()
+                self.camera_roles[0] + "_only_grasp", points=len(target), mesh_to_world=pose.tolist()
             )
             seed, poses = self.fit_registered(
                 name, family, surface, pose, seeds, choice["prior_postures"], others
@@ -1136,7 +1153,7 @@ class Controller:
         return s, poses
 
     def reacquire_head(self, reference, *, after_release=False):
-        """Match a fresh D455 component near a recently released or occluded target."""
+        """Match a fresh primary-camera component near a recently released or occluded target."""
         if reference is None:
             return None
         candidates = []
@@ -1186,7 +1203,7 @@ class Controller:
             return None
         score, p = candidates[0]
         self.event(
-            "reacquired_head_roi",
+            f"reacquired_{self.camera_roles[0]}_roi",
             points=len(p["xyz"]),
             offset_m=float(np.linalg.norm(p["center"][:2] - reference["center"][:2])),
         )
@@ -1980,7 +1997,7 @@ class Controller:
                             and last_seen is not None
                         ):
                             palm = self.io.fk(PALM)
-                            eye = self.io.camera("head")["pose"][:3, 3]
+                            eye = self.io.camera(self.camera_roles[0])["pose"][:3, 3]
                             sight = np.asarray(last_seen["center"])[:2] - eye[:2]
                             lateral = np.array([-sight[1], sight[0]])
                             lateral /= max(1e-8, np.linalg.norm(lateral))
@@ -2000,7 +2017,7 @@ class Controller:
                                     )
                                 except NoPath:
                                     continue
-                                self.event("clear_head_view")
+                                self.event(f"clear_{self.camera_roles[0]}_view")
                                 fresh = self.survey()
                                 local = self.reacquire_head(
                                     last_seen, after_release=True

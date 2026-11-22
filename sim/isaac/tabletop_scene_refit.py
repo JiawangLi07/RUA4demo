@@ -18,7 +18,7 @@ def placements_from_prior(data, surface, reg):
     groups = [indices]
     # Pull the wrist toward the head-observed side by the measured registration
     # residual. The native solver projects the contact sites separately below.
-    live = surface.camera_samples.get("head_depth", np.empty((0, 3)))
+    live = surface.camera_samples.get(getattr(surface, "primary_depth", "head_depth"), np.empty((0, 3)))
     delta = np.zeros(3)
     if len(live):
         cloud = (live - reg[:3, 3]) @ reg[:3, :3]
@@ -316,11 +316,14 @@ class LiveSceneBank(LightningBank):
                 "hand_sha256": provenance["hand_sha256"],
                 "upstream": provenance["upstream"],
             }
+            paired_seed = getattr(ctrl, "sampling_seed", None)
+            if paired_seed is not None:
+                receipt.update(observation_source=ctrl.camera_roles[0], sampling_seed=paired_seed)
             (folder / "placements.json").write_text(json.dumps(receipt, indent=2))
             ctrl.event("scene_native_request", **receipt)
             if proposals:
                 obj, pre_rel, opened, arms, warm, source = zip(*proposals)
-                head = surface.camera_samples.get("head_depth", np.empty((0, 3)))
+                observed = surface.camera_samples.get(getattr(surface, "primary_depth", "head_depth"), np.empty((0, 3)))
                 with (folder / "request.part").open("wb") as f:
                     np.savez_compressed(
                         f,
@@ -332,7 +335,13 @@ class LiveSceneBank(LightningBank):
                         q_open=opened,
                         **{"warm_" + k: np.stack([w[k] for w in warm]) for k in fields},
                         mesh_to_world=reg,
-                        head_local=(head - reg[:3, 3]) @ reg[:3, :3],
+                        **{
+                            (
+                                "observed_local"
+                                if paired_seed is not None
+                                else "head_local"
+                            ): (observed - reg[:3, 3]) @ reg[:3, :3]
+                        },
                         commanded_arm=ctrl.arm,
                         table_m=ctrl.table,
                     )

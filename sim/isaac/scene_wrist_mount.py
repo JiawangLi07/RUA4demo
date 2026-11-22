@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
@@ -51,7 +52,7 @@ def prepare(cad, output):
         )
         a, b = v[edges].transpose(1, 0, 2)
         u, w = a @ axis, b @ axis
-        for i, (lo, hi) in enumerate(zip(levels, levels[1:])):
+        for i, (lo, hi) in enumerate(pairwise(levels)):
             clipped = [v[((v @ axis) >= lo) & ((v @ axis) <= hi)]]
             for level in (lo, hi):
                 cut = (u - level) * (w - level) < 0
@@ -104,12 +105,13 @@ def palm_parts(path, palm_from_tcp, side="right"):
     }
 
 
-def remove_wrist_hardware(stage, robot):
+def remove_wrist_hardware(stage, robot, sides=("right", "left")):
     """Remove native camera prims and camera-specific geometry before PhysX starts."""
     from pxr import Usd, UsdGeom, UsdPhysics
 
     report = {}
-    for side, suffix in (("right", "R"), ("left", "L")):
+    for side in sides:
+        suffix = {"right": "R", "left": "L"}[side]
         tcp_path = f"{robot}/TCP_Link_{suffix}"
         tcp = stage.GetPrimAtPath(tcp_path)
         if not tcp:
@@ -141,16 +143,17 @@ def remove_wrist_hardware(stage, robot):
     return report
 
 
-def install_mount(stage, robot, path):
+def install_mount(stage, robot, path, sides=("right", "left")):
     from pxr import UsdGeom, UsdPhysics
 
     with np.load(path, allow_pickle=False) as data:
-        for side, suffix in (("right", "R"), ("left", "L")):
+        for side in sides:
+            suffix = {"right": "R", "left": "L"}[side]
             root = robot + "/TCP_Link_" + suffix + "/WristCameraFixture"
             if not stage.GetPrimAtPath(robot + "/TCP_Link_" + suffix):
                 raise ValueError("missing wrist TCP")
 
-            def mesh(name, vertices, faces):
+            def mesh(name, vertices, faces, root=root):
                 usd = UsdGeom.Mesh.Define(stage, root + "/" + name)
                 usd.CreatePointsAttr(vertices.astype(np.float32).tolist())
                 usd.CreateFaceVertexCountsAttr([3] * len(faces))

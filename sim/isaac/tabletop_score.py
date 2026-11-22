@@ -114,6 +114,7 @@ def evaluate(scene, directory, lift_height=None):
                 "closure_requested": close_time is not None,
                 "wrist_refined": "registered_wrist" in phases,
                 "head_only_grasp": "head_only_grasp" in phases,
+                "left_observer_only_grasp": "left_observer_only_grasp" in phases,
                 "stable": False,
                 "raised": False,
                 "held_through_end": False,

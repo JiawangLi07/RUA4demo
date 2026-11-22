@@ -51,15 +51,16 @@ def solve_request(folder, args, ctx, api, torch):
         or not np.array_equal(seed["link_names"], ctx[1].get_all_link_names())
     ):
         raise ValueError("native solver provenance mismatch")
-    np.random.seed(int(sha[:8], 16))
-    torch.manual_seed(int(sha[:8], 16))
+    draw_seed = rec.get("sampling_seed", int(sha[:8], 16))
+    np.random.seed(draw_seed)
+    torch.manual_seed(draw_seed)
     mesh = trimesh.load(mesh_file, force="mesh", process=False)
     verts, normals = np.asarray(mesh.vertices), np.asarray(mesh.vertex_normals)
     if len(verts) < 3 or not len(mesh.faces):
         raise ValueError("contact fitting requires a triangle mesh")
     tree = cKDTree(verts)
-    head = req["head_local"]
-    depth = cKDTree(head) if len(head) >= 3 else None
+    observed = req["observed_local"] if "observed_local" in req else req["head_local"]
+    depth = cKDTree(observed) if len(observed) >= 3 else None
     points = trimesh.sample.sample_surface(mesh, 6144)[0]
 
     def gpu(value):
@@ -101,9 +102,9 @@ def solve_request(folder, args, ctx, api, torch):
         if depth is not None:
             dp, ip = depth.query(target, k=3)
             at = dp[:, -1] < 0.008
-            offset = ((head[ip].mean(1) - target) * n).sum(1)
+            offset = ((observed[ip].mean(1) - target) * n).sum(1)
             target[at] += n[at] * (0.35 * np.clip(offset[at], -0.003, 0.003))[:, None]
-            row["head_corrected_sites"] = int(at.sum())
+            row[rec.get("observation_source", "head") + "_corrected_sites"] = int(at.sum())
         n = n * 0.25 + 0.75 * outward
         n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-9)
         link = torch.as_tensor(

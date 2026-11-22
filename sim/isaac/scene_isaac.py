@@ -17,13 +17,12 @@ from PIL import Image
 from pxr import PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics
 from scipy.spatial.transform import Rotation
 
-from .paths import asset_path, RIGHT_JOINTS
-
-from .settling import SIDES, verify_settled
+from .paths import RIGHT_JOINTS, asset_path
 from .scene_assets import collision_bounds, collision_support, remap_render_assets
 from .scene_fixture import pose_matrix, transform_points
 from .scene_kinematics import KinematicTree
 from .scene_objects import install_objects
+from .settling import SIDES, verify_settled
 
 
 def _save(path, value):
@@ -73,18 +72,48 @@ class NativeBimanualScene:
             )
 
         self.fixture_path = None
-        self.bare_tcp_support={}
-        if config.get("wrist_hardware")=="removed":
+        self.bare_tcp_support = {}
+        self.fixture_sides = ()
+        hardware = config.get("wrist_hardware")
+        if hardware in ("removed", "left-only"):
             from .scene_wrist_mount import remove_wrist_hardware
-            hardware=remove_wrist_hardware(stage,config["robot_prim"])
-            _save(out/"wrist_assembly.json",hardware)
-            self.bare_tcp_support={side:collision_support(stage,config["robot_prim"]+"/TCP_Link_"+suffix)
-                                   for side,suffix in (("right","R"),("left","L"))}
-        elif "tabletop_seed" in config:
-            from .scene_wrist_mount import resolve_mount, install_mount
+
+            bare = ("right",) if hardware == "left-only" else ("right", "left")
+            report = remove_wrist_hardware(stage, config["robot_prim"], bare)
+            self.bare_tcp_support = {
+                side: collision_support(
+                    stage, config["robot_prim"] + "/TCP_Link_" + side[0].upper()
+                )
+                for side in bare
+            }
+        if "tabletop_seed" in config and hardware != "removed":
+            from .scene_wrist_mount import install_mount, resolve_mount
+
             self.fixture_path = resolve_mount(config.get("wrist_mount"))
+            if hardware == "left-only" and self.fixture_path is None:
+                raise ValueError("left observer requires the registered wrist mount bundle")
             if self.fixture_path:
-                install_mount(stage, config["robot_prim"], self.fixture_path)
+                self.fixture_sides = (
+                    ("left",) if hardware == "left-only" else ("right", "left")
+                )
+                install_mount(
+                    stage, config["robot_prim"], self.fixture_path, self.fixture_sides
+                )
+        if hardware in ("removed", "left-only"):
+            if hardware == "left-only":
+                tcp = stage.GetPrimAtPath(config["robot_prim"] + "/TCP_Link_L")
+                prims = list(Usd.PrimRange(tcp, Usd.TraverseInstanceProxies()))
+                report["left"] = {
+                    "active_wrist_cameras": [
+                        str(p.GetPath()) for p in prims if p.IsA(UsdGeom.Camera)
+                    ],
+                    "fixture_colliders": sum(
+                        p.HasAPI(UsdPhysics.CollisionAPI)
+                        and "WristCameraFixture" in str(p.GetPath())
+                        for p in prims
+                    ),
+                }
+            _save(out / "wrist_assembly.json", report)
 
         def mapping(key):
             return dict(zip(motors["joint_names"], motors[key][0]))
@@ -94,6 +123,13 @@ class NativeBimanualScene:
             if name not in initial_joints or not np.isfinite(value):
                 raise ValueError(f"invalid initial joint position for {name}")
             initial_joints[name] = float(value)
+        self.tree = KinematicTree.from_urdf(source / "robot_cad.urdf")
+        if hardware == "left-only":
+            left_arm = [f"Joint{i}_L" for i in range(1, 8)]
+            bounds = self.tree.joint_limits(left_arm)
+            angles = np.asarray([initial_joints[joint] for joint in left_arm])
+            if np.any((angles < bounds[:, 0]) | (angles > bounds[:, 1])):
+                raise ValueError("left observation pose exceeds native arm limits")
         self.robot = Articulation(
             ArticulationCfg(
                 prim_path=config["robot_prim"],
@@ -152,14 +188,22 @@ class NativeBimanualScene:
             )
         )
         self.wrist_devices = {}
-        if config.get("head_wrist_validation") and config.get("camera_mode")!="head":
+        paths = {}
+        if hardware == "left-only":
+            paths["left"] = config["robot_prim"] + "/TCP_Link_L/wrist2_camera"
+        elif config.get("camera_mode") != "head" and config.get(
+            "head_wrist_validation"
+        ):
+            paths["right"] = config["head_wrist_validation"]["camera_prim"]
+            if config.get("active_hands") in ("both", "left"):
+                paths["left"] = config["robot_prim"] + "/TCP_Link_L/wrist2_camera"
+        if paths:
             from .head_wrist_geometry import usd_camera_intrinsics
 
-            paths = {"right": config["head_wrist_validation"]["camera_prim"]}
-            if config.get("active_hands") in ("both", "left"):
-                paths["left"] = "/World/Robot/TCP_Link_L/wrist2_camera"
             for side, wrist_path in paths.items():
                 wrist_prim = stage.GetPrimAtPath(wrist_path)
+                if not wrist_prim or not wrist_prim.IsA(UsdGeom.Camera):
+                    raise ValueError(f"missing native {side} wrist camera at {wrist_path}")
                 wrist_local = np.asarray(UsdGeom.Xformable(wrist_prim).GetLocalTransformation()).copy()
                 eye = wrist_local.T @ np.diag([1.0, -1.0, -1.0, 1.0])
                 # Native camera optics with a world-space render proxy synchronized
@@ -198,7 +242,8 @@ class NativeBimanualScene:
                     )
                 )
                 self.wrist_devices[side] = (sensor, eye, k)
-            self.wrist_camera, self.tcp_from_wrist_optical, self.wrist_K = self.wrist_devices["right"]
+            if "right" in self.wrist_devices:
+                self.wrist_camera, self.tcp_from_wrist_optical, self.wrist_K = self.wrist_devices["right"]
         self.observer_camera = None
         observer = config["images"].get("observer")
         if observer:
@@ -289,7 +334,6 @@ class NativeBimanualScene:
         np.savez_compressed(out / "collision_support.npz", **self.hand_support, **self.object_support)
         table_range = cache.ComputeWorldBound(stage.GetPrimAtPath(config["table_prim"])).ComputeAlignedRange()
         self.table_bounds = np.array([table_range.GetMin(), table_range.GetMax()])
-        self.tree = KinematicTree.from_urdf(source / "robot_cad.urdf")
         self.body_ids = {
             name: self.robot.body_names.index(name) for side in SIDES for name in self.hand_bounds[side]
         }
@@ -313,6 +357,8 @@ class NativeBimanualScene:
         self.time, self.frame_number, self.step_number = 0.0, 0, 0
         self.frames = out / "frames"
         self.frames.mkdir()
+        if hardware == "left-only":
+            (out / "left_observer_frames").mkdir()
         self.png_options = {"compress_level": 1} if "tabletop_seed" in config else {}
         self.settling_receipt = None
         self.frame_times = []
@@ -363,8 +409,34 @@ class NativeBimanualScene:
             "objects": {name: obj.data.root_state_w[0].cpu().tolist() for name, obj in self.objects.items()},
         }
 
+    def sync_wrist_camera(self, side):
+        """Drive the render proxy from the physical TCP. Controller extrinsics use encoder FK."""
+        sensor, eye, _ = self.wrist_devices[side]
+        body = self.robot.body_names.index("TCP_Link_" + side[0].upper())
+        physical = (
+            pose_matrix(
+                self.robot.data.body_pos_w[0, body].cpu().numpy(),
+                self.robot.data.body_quat_w[0, body].cpu().numpy(),
+            )
+            @ eye
+        )
+        quat = np.roll(Rotation.from_matrix(physical[:3, :3]).as_quat(), 1)
+        sensor.set_world_poses(
+            physical[None, :3, 3].astype("float32"),
+            quat[None].astype("float32"),
+            convention="ros",
+        )
+
     def capture(self):
+        record_left = self.config.get("wrist_hardware") == "left-only"
+        if record_left:
+            self.sync_wrist_camera("left")
         self.world.render()
+        if record_left:
+            side_sensor = self.wrist_devices["left"][0]
+            side_sensor.update(self.config["physics_dt"], force_recompute=True)
+            rgb = side_sensor.data.output["rgb"][0, ..., :3].cpu().numpy()
+            Image.fromarray(rgb).save(self.out / "left_observer_frames" / f"{self.frame_number:06d}.png", **self.png_options)
         self.camera.update(self.config["physics_dt"], force_recompute=True)
         image = self.camera.data.output["rgb"][0, ..., :3].cpu().numpy()
         Image.fromarray(image).save(self.frames / f"{self.frame_number:06d}.png", **self.png_options)

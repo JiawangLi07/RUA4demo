@@ -3,7 +3,7 @@
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from .tabletop_control import NoPath, PALM, shifted
+from .tabletop_control import PALM, NoPath, shifted
 from .tabletop_handle import reobserve
 
 
@@ -75,7 +75,7 @@ def seat_before_close(ctrl, surface, pose, grasp, opened):
             target_shift_m=shift.tolist(),
         )
         if gap <= 0.005 and angle <= np.deg2rad(5):
-            frame = ctrl.snapshot("head", "palm_at_grasp")
+            frame = ctrl.snapshot(ctrl.camera_roles[0], "palm_at_grasp")
             pixels = depth_support(ctrl, frame)
             if pixels >= 8:
                 ctrl.event(
@@ -88,7 +88,7 @@ def seat_before_close(ctrl, surface, pose, grasp, opened):
                 )
                 ctrl.seat_trim = bias.copy()
                 return updated, registration, shift
-            reject(ctrl, opened, f"head depth supports only {pixels} hand pixels")
+            reject(ctrl, opened, f"{ctrl.camera_roles[0]} depth supports only {pixels} hand pixels")
         if gap > 0.055 or angle > np.deg2rad(22):
             reject(ctrl, opened, "arm failed to follow final approach")
         # Bounded steady-state compensation, always using physical joint readback.

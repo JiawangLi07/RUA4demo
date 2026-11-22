@@ -81,11 +81,11 @@ def main():
         action="store_true",
         help="allow Sharpa links to touch the physical table during head-only grasp planning",
     )
-    parser.add_argument("--camera-mode", choices=("head", "head-wrist"), default="head")
+    parser.add_argument("--camera-mode", choices=("head", "head-wrist", "left-observer"), default="head")
     parser.add_argument(
         "--wrist-hardware",
-        choices=("removed", "mounted"),
-        help="defaults to removed for head-only operation, mounted for head-wrist",
+        choices=("removed", "mounted", "left-only"),
+        help="mounted sides, inferred from camera mode unless set explicitly",
     )
     parser.add_argument("--hands", choices=("right", "left", "both"), default="right")
     parser.add_argument(
@@ -120,8 +120,9 @@ def main():
     )
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
-    if args.allow_hand_table_contact and args.camera_mode != "head":
-        parser.error("--allow-hand-table-contact requires head-only planning")
+    single_view = args.camera_mode != "head-wrist"
+    if args.allow_hand_table_contact and not single_view:
+        parser.error("--allow-hand-table-contact requires a single planning camera")
     if args.scene_candidates and (
         not args.adaptive_grasps
         or args.observe_only
@@ -129,10 +130,10 @@ def main():
         or args.mesh_grasps
         or args.template_comparison
         or args.hybrid_grasps
-        or args.camera_mode != "head"
+        or not single_view
     ):
         parser.error(
-            "--scene-candidates requires a head-only adaptive Lightning grasp trial"
+            "--scene-candidates requires a single-view adaptive Lightning grasp trial"
         )
     if args.placement_chart and not args.export_lightning_placements:
         parser.error("--placement-chart requires --export-lightning-placements")
@@ -157,9 +158,16 @@ def main():
                 solver, bank_path = grasp_source(args)
         except ValueError as error:
             parser.error(str(error))
-    hardware = args.wrist_hardware or (
-        "removed" if args.camera_mode == "head" else "mounted"
+    hardware = (
+        args.wrist_hardware
+        or {"head": "removed", "head-wrist": "mounted", "left-observer": "left-only"}[
+            args.camera_mode
+        ]
     )
+    if args.camera_mode == "left-observer" and hardware != "left-only":
+        parser.error("left-observer mode requires left-only wrist hardware")
+    if hardware == "left-only" and (args.hands != "right" or not single_view):
+        parser.error("the left camera arm is reserved for observation; choose right-hand single-view operation")
     if hardware == "removed" and (
         args.camera_mode != "head" or args.wrist_mount is not None
     ):
@@ -185,13 +193,25 @@ def main():
         config["record_hand_table_contact"] = args.allow_hand_table_contact
         config["camera_mode"] = args.camera_mode
         config["wrist_hardware"] = hardware
+        if hardware == "left-only":
+            from .tabletop_layout import LEFT_OBSERVER_ARM
+
+            initial = config.setdefault("initial_joint_positions", {})
+            angles = np.asarray(
+                config.get("left_observer_arm_rad", LEFT_OBSERVER_ARM), dtype=float
+            )
+            if angles.shape != (7,) or not np.isfinite(angles).all():
+                raise ValueError(
+                    "left_observer_arm_rad requires seven finite left arm angles in radians"
+                )
+            initial.update({f"Joint{i}_L": float(q) for i, q in enumerate(angles, 1)})
         arm_feedback = (
             not args.observe_only
             and args.adaptive_grasps
-            and args.camera_mode == "head"
+            and single_view
             and solver == "lightning_grasp"
         )
-        config["arm_joint_feedback"] = arm_feedback
+        config["arm_joint_feedback"] = arm_feedback or hardware == "left-only"
         if args.wrist_mount:
             config["wrist_mount"] = str(args.wrist_mount.resolve())
         scene = NativeBimanualScene(config, out, args.device)
@@ -200,8 +220,9 @@ def main():
         home = io.commanded_joints()
         for _ in range(round(1.5 / io.dt)):
             io.step(home[io.arm], home[io.hand])
-        head = io.camera("head")
-        np.savez_compressed(out / "initial_head.npz", **head)
+        primary = io.camera_roles[0]
+        frame = io.camera(primary)
+        np.savez_compressed(out / f"initial_{primary}.npz", **frame)
         (out / "joint_names.json").write_text(json.dumps(io.names))
         # The auditor has no return channel into the controller.
         try:
@@ -227,7 +248,7 @@ def main():
                     json.dumps(
                         {
                             "lift_height_m": args.lift_height_m,
-                            "grasp_inputs": "head_rgbd_mesh_arm_joint_feedback"
+                            "grasp_inputs": f"{primary}_rgbd_mesh_arm_joint_feedback"
                             if arm_feedback
                             else "rgbd_mesh_commanded_kinematics",
                             "joint_observation": "arm_feedback_finger_targets"
@@ -242,6 +263,7 @@ def main():
                             "allow_hand_table_contact": args.allow_hand_table_contact,
                             "adaptive_grasps": args.adaptive_grasps,
                             "mount_installed": scene.fixture_path is not None,
+                            **({"left_observer_arm_rad": angles.tolist()} if hardware == "left-only" else {}),
                         }
                     )
                 )
@@ -346,6 +368,15 @@ def main():
                     {
                         "controller_reads": scene.sensor_calls,
                         "active_wrist_devices": list(scene.wrist_devices),
+                        "frame_cameras": {
+                            "frames": "head",
+                            "observer_frames": "external_observer",
+                            **(
+                                {"left_observer_frames": "left_observer"}
+                                if hardware == "left-only"
+                                else {}
+                            ),
+                        },
                     }
                 )
             )

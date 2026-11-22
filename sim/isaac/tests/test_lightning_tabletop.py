@@ -14,7 +14,8 @@ from sim.isaac.tabletop_lightning import (
 from sim.isaac.tabletop_lightning_banks import merge
 
 
-def test_remove_camera_and_mount_preserves_hand_flange():
+@pytest.mark.parametrize("sides", [("right", "left"), ("right",)])
+def test_remove_camera_and_mount_preserves_hand_flange(sides):
     pytest.importorskip("pxr")
     from pxr import Usd, UsdGeom, UsdPhysics
     from sim.isaac.scene_wrist_mount import remove_wrist_hardware
@@ -29,26 +30,33 @@ def test_remove_camera_and_mount_preserves_hand_flange():
                 UsdGeom.Mesh.Define(stage, root + "/" + part).GetPrim()
             )
     for _ in range(2):
-        report = remove_wrist_hardware(stage, "/Robot")
-        for side, row in report.items():
+        report = remove_wrist_hardware(stage, "/Robot", sides)
+        assert set(report) == set(sides)
+        if "left" not in sides:
+            assert stage.GetPrimAtPath("/Robot/TCP_Link_L/wrist2_camera").IsActive()
+            assert stage.GetPrimAtPath(
+                "/Robot/TCP_Link_L/WristCameraFixture/housing"
+            ).HasAPI(UsdPhysics.CollisionAPI)
+        for row in report.values():
             assert row["active_wrist_cameras"] == []
             assert row["fixture_colliders"] == row["fixture_prims"] == 0
             assert len(row["retained_tcp_colliders"]) == 1
             assert row["retained_tcp_colliders"][0].endswith("cad_adapter_plate")
 
 
-def test_head_only_lift_initializes_only_head_observation(monkeypatch):
+@pytest.mark.parametrize("sensor", ["head", "left_observer"])
+def test_single_view_lift_uses_only_the_planning_sensor(monkeypatch, sensor):
     from sim.isaac import tabletop_tracking
 
     controller = Controller.__new__(Controller)
     controller.io = object()
-    controller.camera_roles = ("head",)
+    controller.camera_roles = (sensor,)
     calls = []
     controller.snapshot = lambda role, tag: calls.append((role, tag))
     monkeypatch.setattr(tabletop_tracking, "initialize", lambda *args: None)
     controller.begin_lift(SimpleNamespace(world=np.zeros((4, 3))))
-    assert calls == [("head", "before_lift")]
-    assert set(controller.tracks) == {"head"}
+    assert calls == [(sensor, "before_lift")]
+    assert set(controller.tracks) == {sensor}
 
 
 def test_bank_preserves_native_indices_and_rejects_mismatched_object(tmp_path):
@@ -423,6 +431,7 @@ def test_carry_ik_draws_five_opposed_pads_together():
 
 def test_head_reacquisition_after_a_roll_requires_a_unique_mesh_fit():
     ctrl = Controller.__new__(Controller)
+    ctrl.camera_roles = ("head",)
     ctrl.name, ctrl.table = "test", 0.72
     ctrl.event = lambda *args, **kwargs: None
     ref = dict(center=np.zeros(3), color=np.ones(4), dims=np.array([0.07, 0.065, 0.20]))

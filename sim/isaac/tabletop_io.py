@@ -3,7 +3,6 @@
 from types import SimpleNamespace
 
 import numpy as np
-from scipy.spatial.transform import Rotation
 
 from .head_wrist_trial import ARM
 from .scene_fixture import pose_matrix
@@ -138,7 +137,7 @@ class PhysicsRecording:
         if self.scene.fixture_path is not None:
             from .scene_wrist_mount import mount_parts
 
-            for side in self.sides:
+            for side in self.scene.fixture_sides:
                 fields[side + "_fixture_tcp_vertices"] = np.vstack(
                     list(mount_parts(self.scene.fixture_path, side).values())
                 )
@@ -169,22 +168,27 @@ def connect(scene, out, side="right", audit=None):
     palm = side + "_hand_C_MC"
     arm = [names.index(n.replace("_R", "_" + suffix)) for n in ARM]
     hand = list(scene.ids[side])
-    head = scene.camera
-    # Fixed head extrinsics and hand-eye calibration are available at the station.
-    head_pose = pose_matrix(
-        head.data.pos_w[0].cpu().numpy(), head.data.quat_w_ros[0].cpu().numpy()
-    )
+    left_primary = scene.config.get("camera_mode") == "left-observer"
+    head, head_pose, head_k = scene.camera, None, None
+    if not left_primary:
+        head_pose = pose_matrix(
+            head.data.pos_w[0].cpu().numpy(), head.data.quat_w_ros[0].cpu().numpy()
+        )
+        head_k = head.data.intrinsic_matrices[0].cpu().numpy().astype(float)
+        head_k[:2, 2] -= 0.5
     wrist_sensor, eye, wrist_intrinsics = scene.wrist_devices.get(
         side, (None, None, None)
     )
     roles = ("head",) if wrist_sensor is None else ("head", "wrist")
-    head_k = head.data.intrinsic_matrices[0].cpu().numpy().astype(float)
-    head_k[:2, 2] -= 0.5
+    if left_primary:
+        roles = ("left_observer",)
     wrist_k = None if wrist_intrinsics is None else wrist_intrinsics.copy()
     if wrist_k is not None:
         wrist_k[:2, 2] -= 0.5
     if not hasattr(scene, "sensor_calls"):
         scene.sensor_calls = {"head": 0, "wrist": 0}
+        if scene.config.get("wrist_hardware") == "left-only":
+            scene.sensor_calls["left_observer"] = 0
 
     if not hasattr(scene, "commanded_targets"):
         scene.commanded_targets = scene.target[0].cpu().numpy().astype(float, copy=True)
@@ -219,28 +223,13 @@ def connect(scene, out, side="right", audit=None):
         angles = joint_feedback()
         if role == "head":
             sensor, pose, k = head, head_pose, head_k
-        elif role == "wrist":
-            sensor, pose, k = (
-                wrist_sensor,
-                fk(tcp, angles) @ eye,
-                wrist_k,
-            )
-            # The rendered image must move with the physical mount even if the
-            # arm lags its setpoint. The planner receives only nominal hand-eye calibration.
-            body = scene.palm_ids[side]
-            render_pose = (
-                pose_matrix(
-                    scene.robot.data.body_pos_w[0, body].cpu().numpy(),
-                    scene.robot.data.body_quat_w[0, body].cpu().numpy(),
-                )
-                @ palm_eye
-            )
-            quat = np.roll(
-                Rotation.from_matrix(render_pose[:3, :3]).as_quat(), 1
-            ).astype("float32")
-            sensor.set_world_poses(
-                render_pose[None, :3, 3].astype("float32"), quat[None], convention="ros"
-            )
+        elif role in ("wrist", "left_observer"):
+            camera_side = "left" if role == "left_observer" else side
+            sensor, hand_eye, intrinsics = scene.wrist_devices[camera_side]
+            k = intrinsics.copy()
+            k[:2, 2] -= 0.5
+            pose = fk("TCP_Link_" + camera_side[0].upper(), angles) @ hand_eye
+            scene.sync_wrist_camera(camera_side)
             scene.world.render()
         else:
             raise ValueError(role)
@@ -250,6 +239,7 @@ def connect(scene, out, side="right", audit=None):
         return {
             "rgb": data["rgb"][0, ..., :3].cpu().numpy().copy(),
             "depth": data["distance_to_image_plane"][0, ..., 0].cpu().numpy().copy(),
+            "sensor": role,
             "K": k.copy(),
             "pose": pose.copy(),
             "q": angles,
@@ -276,7 +266,7 @@ def connect(scene, out, side="right", audit=None):
 
     model = SimpleNamespace(
         fixture_palm=palm_parts(
-            scene.fixture_path, np.linalg.solve(fk(palm), fk(tcp)), side
+            scene.fixture_path if side in scene.fixture_sides else None, np.linalg.solve(fk(palm), fk(tcp)), side
         ),
         tree=tree,
         robot=SimpleNamespace(joint_names=names),
@@ -293,6 +283,7 @@ def connect(scene, out, side="right", audit=None):
         )
     physical = SimpleNamespace(
         side=side,
+        paired_scene_seed=scene.config["tabletop_seed"] if scene.config.get("wrist_hardware") == "left-only" else None,
         camera_roles=roles,
         commanded_joints=commanded_joints,
         joint_feedback=joint_feedback,

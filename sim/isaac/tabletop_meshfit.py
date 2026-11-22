@@ -109,7 +109,7 @@ class ContactSurface:
         cost = distance + 0.028 * (1 - cosine)
         cost += (
             0.0070 * (self.source == "registered_prior")
-            + 0.001 * (self.source == "head_depth")
+            + 0.001 * np.isin(self.source, ("head_depth", "left_observer_depth"))
             + 0.0015 * (self.source == "visual_mesh")
         )
         if side_wall:

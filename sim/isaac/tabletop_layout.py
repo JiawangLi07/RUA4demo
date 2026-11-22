@@ -10,6 +10,19 @@ from scipy.spatial.transform import Rotation
 
 from .scene_meshes import load_mesh_bundle
 
+# Fixed station view of the right work area. The left camera points diagonally down
+# from approximately (0.47, 0.065, 1.055) m. The right work area falls below
+# the left thumb in the image, with the observer elbow above the desk.
+LEFT_OBSERVER_ARM = (
+    0.1984946663,
+    -1.1010018464,
+    0.4981714732,
+    -1.9647742050,
+    -0.3117609404,
+    0.1204626939,
+    0.7738577082,
+)
+
 PARK_ARMS = {
     "L": [
         -1.290963836,
