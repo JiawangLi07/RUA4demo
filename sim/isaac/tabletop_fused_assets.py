@@ -22,7 +22,45 @@ def hull_mesh(points):
     return vertices.astype(np.float32), faces.astype(np.int32)
 
 
-def prepare(path, record, out, mass=None):
+def collision_hulls(v, f, decompose):
+    if decompose:
+        from vhacdx import compute_vhacd
+
+        # V-HACD's binding expects VTK polygon records (3, i, j, k).
+        records = np.column_stack((np.full(len(f), 3), f)).ravel().astype(np.uint32)
+        # Use the same metric vertex precision as the dense Lightning PLY.
+        points = np.ascontiguousarray(v, dtype=np.float32).astype(np.float64)
+        hulls = compute_vhacd(
+            points,
+            records,
+            maxConvexHulls=32,
+            resolution=600000,
+            minimumVolumePercentErrorAllowed=1.0,
+            maxNumVerticesPerCH=64,
+            asyncACD=False,
+        )
+        parts = [
+            hull_mesh(vertices)
+            for vertices, _ in hulls
+            if len(vertices) >= 4
+            and np.linalg.matrix_rank(vertices - vertices.mean(0)) == 3
+        ]
+        if not parts:
+            raise ValueError("convex decomposition produced no volumetric collision parts")
+        return parts
+    # Overlapping axial slabs reproduce the original approximation for elongated scans.
+    vv, axes = np.linalg.eigh(np.cov(v.T))
+    along = v @ axes[:, -1]
+    ratio = np.sqrt(vv[-1] / max(vv[-2], 1e-12))
+    parts = int(np.clip(np.ceil(ratio * 2), 3, 10)) if ratio > 1.55 else 1
+    edges = np.linspace(along.min(), along.max(), parts + 1)
+    return [
+        hull_mesh(v[(along >= lo - 0.0007) & (along <= hi + 0.0007)])
+        for lo, hi in zip(edges, edges[1:])
+    ]
+
+
+def prepare(path, record, out, mass=None, *, decompose=False):
     source = trimesh.load(path, force="mesh", process=False)
     raw = np.array(source.vertices, dtype=float)
     if len(raw) != record["vertices"] or len(source.faces) != record["faces"]:
@@ -68,19 +106,11 @@ def prepare(path, record, out, mass=None):
         visual_faces=faces.astype(np.int32),
         visual_colors=color.astype(np.float32),
     )
-    # Intersect the surface with overlapping axial slabs for elongated parts.
-    # Short round objects use one hull. Sharp concavities remain approximations.
-    vv, axes = np.linalg.eigh(np.cov(v.T))
-    along = v @ axes[:, -1]
-    ratio = np.sqrt(vv[-1] / max(vv[-2], 1e-12))
-    parts = int(np.clip(np.ceil(ratio * 2), 3, 10)) if ratio > 1.55 else 1
-    edges = np.linspace(along.min(), along.max(), parts + 1)
-    for i, (lo, hi) in enumerate(zip(edges, edges[1:])):
-        points = v[(along >= lo - 0.0007) & (along <= hi + 0.0007)]
-        data[f"collision_{i:03d}_vertices"], data[f"collision_{i:03d}_faces"] = (
-            hull_mesh(points)
-        )
-    data["collision_count"] = np.array(parts)
+    parts = collision_hulls(v, f, decompose)
+    for i, (collider_vertices, collider_faces) in enumerate(parts):
+        data[f"collision_{i:03d}_vertices"] = collider_vertices
+        data[f"collision_{i:03d}_faces"] = collider_faces
+    data["collision_count"] = np.array(len(parts))
     raw_sha = hashlib.sha256(path.read_bytes()).hexdigest()
     key = "fused_" + raw_sha[:9]
     file = out / "fused_metric" / (key + ".npz")
@@ -116,7 +146,8 @@ def prepare(path, record, out, mass=None):
         coarse_faces=len(faces),
         raw_to_object=transform.tolist(),
         dimensions_m=np.ptp(v, axis=0).tolist(),
-        hulls=parts,
+        hulls=len(parts),
+        collision_method="vhacd" if decompose else "axial",
         views_in_offline_fusion=record["views"],
         fused_head_depth_p50_mm=record["fused_check"]["head"]["depth_p50_mm"],
         mass_kg=mass,
@@ -141,6 +172,11 @@ def main():
     p.add_argument("--input", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True)
     p.add_argument(
+        "--convex-decomposition",
+        action="store_true",
+        help="use V-HACD to preserve concave collision geometry (requires vhacdx)",
+    )
+    p.add_argument(
         "--mass-reference", type=Path, help="previous scene JSON with added_objects"
     )
     a = p.parse_args()
@@ -150,10 +186,12 @@ def main():
         raise ValueError("incomplete or nonunique fused scan manifest")
     masses = {}
     if a.mass_reference:
-        masses = {
-            Path(o["mesh"]["file"]).stem: o["mass_kg"]
-            for o in json.loads(a.mass_reference.read_bytes())["added_objects"]
-        }
+        for obj in json.loads(a.mass_reference.read_bytes())["added_objects"]:
+            if "mesh" in obj:
+                masses[Path(obj["mesh"]["file"]).stem] = obj["mass_kg"]
+                if "name" in obj:
+                    # Fused bundles use a content hash as their file stem.
+                    masses.setdefault(obj["name"], obj["mass_kg"])
     entries, objects, aliases, receipts = {}, {}, {}, {}
     for r in sorted(
         rows, key=lambda r: (r["id"] not in ("bottle", "driver", "tube"), r["id"])
@@ -162,7 +200,11 @@ def main():
         if Path(name).name != name:
             raise ValueError("invalid scan ID")
         k, prior, physical, info = prepare(
-            a.input / (name + ".glb"), r, a.out, masses.get(name)
+            a.input / (name + ".glb"),
+            r,
+            a.out,
+            masses.get(name),
+            decompose=a.convex_decomposition,
         )
         entries[k] = {"prior": prior}
         objects[name] = physical

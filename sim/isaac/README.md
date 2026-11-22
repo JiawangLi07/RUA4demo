@@ -173,6 +173,8 @@ For a paired head-camera run, change `--camera-mode` to `head` and keep `--wrist
 
 The fused GLBs are object-local in metres with table Y up. The converter checks their bounds and topology against the capture evaluation, rotates them to station Z up and records the transform. Full-resolution triangles supply the Lightning Grasp surface. A lighter visual mesh and convex parts supply the simulator. Mass and friction are simulation assumptions. The capture report distinguishes the views used to build these stored models from the cameras used at runtime.
 
+For open containers and other concave objects, install `vhacdx` in the asset-preparation environment and pass `--convex-decomposition` to `tabletop_fused_assets`. It fits up to 32 convex parts to the dense metric scan. Check the opening and inner walls against the visible surface before using the asset. Regenerate dependent grasp banks against the new bundle checksum.
+
 ```bash
 python -m sim.isaac.tabletop_fused_assets --input "$FUSED_MODELS" --out "$FUSED" --mass-reference "$REFERENCE_SCENE"
 python -m sim.isaac.tabletop_lightning_assets --station real2sim_0417 --out "$HAND"
