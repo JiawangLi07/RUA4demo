@@ -50,7 +50,7 @@ def match_surface_patches(tree, normals, sites, outward):
     return matched, gaps, alignment, recovered
 
 
-def solve_request(folder, args, ctx, api, torch):
+def solve_request(folder, args, ctx, api, torch, collision_ik=None):
     import trimesh
     from lygra.pipeline.module.collision import batch_filter_collision
 
@@ -176,6 +176,15 @@ def solve_request(folder, args, ctx, api, torch):
                 ctx[1], result["q"], result["object_pose"], samples, ctx[5], ctx[4]
             )
             row["free_joints_from_pregrasp"] = True
+        if collision_ik is not None and not native_collision_mask(flags, 1).item():
+            world_from_palm = req["mesh_to_world"] @ np.linalg.inv(pose)
+            repaired, row["collision_refit"] = collision_ik.refine(
+                result, samples, world_from_palm, float(req["table_m"])
+            )
+            if repaired:
+                flags = batch_filter_collision(
+                    ctx[1], result["q"], result["object_pose"], samples, ctx[5], ctx[4]
+                )
         if not native_collision_mask(flags, 1).item():
             row["stage"] = "native_collision"
             continue
@@ -210,12 +219,14 @@ def solve_request(folder, args, ctx, api, torch):
         "rows": rows,
         "gpu": torch.cuda.get_device_name(),
         "upstream": args.revision,
+        "collision_aware_ik": collision_ik is not None,
         "seconds": time.monotonic() - begin,
     }
     if kept:
         receipt = dict(
             rec,
             method="live_scene_contact_refit",
+            collision_aware_ik=collision_ik is not None,
             source_frame="object_to_palm",
             request_sha256=sha,
         )
@@ -245,6 +256,11 @@ def main():
     for key in ("upstream", "hand", "meshes", "priors", "queue"):
         parser.add_argument("--" + key, type=Path, required=True)
     parser.add_argument("--once", action="store_true")
+    parser.add_argument(
+        "--collision-aware-ik",
+        action="store_true",
+        help="Refit collision-rejected candidates using the contact and separation objectives of Mana algorithm 1.",
+    )
     args = parser.parse_args()
     sys.path.insert(0, str(args.upstream.resolve()))
     import demo as api
@@ -258,6 +274,11 @@ def main():
     random.seed(0)
     torch.manual_seed(0)
     ctx = prepare(api, torch, args)
+    collision_ik = None
+    if args.collision_aware_ik:
+        from .tabletop_collision_ik import CollisionAwareIK
+
+        collision_ik = CollisionAwareIK(ctx, torch)
     print("ready for scene requests", flush=True)
     while True:
         pending = sorted(
@@ -274,7 +295,7 @@ def main():
                 if (folder / "result.json").exists():
                     continue
                 try:
-                    result = solve_request(folder, args, ctx, api, torch)
+                    result = solve_request(folder, args, ctx, api, torch, collision_ik)
                 except Exception as exc:  # noqa: BLE001 - report worker errors to the waiting episode.
                     import traceback
 

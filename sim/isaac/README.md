@@ -241,6 +241,8 @@ Start the solver in the Lightning Grasp environment and the episode in the Isaac
   --meshes "$METRIC_PLY" --priors "$NATIVE_PRIORS" --queue "$RUN/scene_generation"
 ```
 
+Add `--collision-aware-ik` to the solver to try collision-aware contact fitting on the Sharpa hand. When a candidate fails its collision check, the solver keeps the reachable wrist fixed and jointly fits finger contact points, normals and link separation on the registered mesh. It uses a soft table term, the native hand–object and self-collision checks and a 4 mm contact-fit tolerance. Each affected row in `result.json` records its initial and final checks. The episode uses the existing proposal budget, controller and physical lift score. This implementation adapts [Mana algorithm 1](https://arxiv.org/html/2606.13677v1#A1.SS1).
+
 ```bash
 "$ISAAC_PY" -m sim.isaac.tabletop_native --scene "$SCENE" --library "$REGISTRY" --target "$TARGET" \
   --out "$RUN" --hands "$SIDE" --camera-mode head --wrist-hardware removed --adaptive-grasps \
