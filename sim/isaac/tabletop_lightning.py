@@ -385,13 +385,18 @@ class LightningBank:
         seated = shifted(palm, seat_depth * palm[:3, 0])
         if not ctrl.clear(seated, tight, others):
             seated, seat_depth = palm, 0.0
+        identity = {
+            "bank_sha256": receipt["bank_sha256"],
+            "bank_row": int(i),
+            "candidate_source": str(data["source"][i]),
+            "source_id": int(data["source_id"][i]),
+        }
         ctrl.event(
             "selected",
             origin="lightning_grasp",
             posture=posture,
             upstream=receipt["upstream"],
-            candidate_source=str(data["source"][i]),
-            source_id=int(data["source_id"][i]),
+            **identity,
             native_contact_links=links[i, present[i]].tolist(),
             physical_contact_links=[
                 str(link).replace("right_", ctrl.side + "_")
@@ -408,7 +413,6 @@ class LightningBank:
                 tier[i] - 1
             ],
             supported_finger_geometry=supported[i].tolist(),
-            bank_sha256=receipt["bank_sha256"],
             rgbd_object_pose=reg.tolist(),
             palm_grasp=palm.tolist(),
             native_q=q.tolist(),
@@ -419,6 +423,7 @@ class LightningBank:
         return dict(
             posture=posture,
             origin="lightning_grasp",
+            lightning_candidate=identity,
             q_open=open_q,
             q_touch=q,
             q_tight=tight,

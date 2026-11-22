@@ -1,6 +1,6 @@
 # 天机右手的 Isaac Sim 抓取
 
-随机桌面入口 `tabletop_native` 根据 D455 和 D405 的 RGB-D、米制网格与机器人 CAD 计算预抓掌位、接触掌位和 22 关节闭合轨迹。试提 2 cm 后用相机检查目标，再将目标抬离桌面 5 cm。手型也可以在 CPU 上独立求解，命令见下方「直接在 CPU 上算掌位和指角」。
+随机桌面入口 `tabletop_native` 默认从 Lightning Grasp 候选库取抓取掌位和 22 个手指关节角。头部 D455 将米制网格配准到桌面，机器人 CAD 用于检查预抓、闭合和抬升路径。试提 2 cm 后再次用头部相机检查目标，最终目标为离桌 5 cm。下方「直接在 CPU 上算掌位和指角」保留了几何方法的对照。
 
 ## 单件接触反馈对照
 
@@ -149,7 +149,7 @@ python -m sim.isaac.tabletop_registry --mesh object.glb --meters-per-unit 1 --up
   --catalog /path/to/replay/shared_postures.json.gz --out "$RUA_SIM_ASSETS"
 python -m sim.isaac.tabletop_layout --base sim/isaac/config/station.json \
   --objects "$RUA_SIM_ASSETS/objects.json" --seed 41 --out table41.json
-"$ISAAC_PYTHON" -m sim.isaac.tabletop_native --scene table41.json \
+"$ISAAC_PYTHON" -m sim.isaac.tabletop_native --scene table41.json --mesh-grasps \
   --library "$RUA_SIM_ASSETS/registry.json" --out runs/table41 --headless --device cuda:0
 OPENBLAS_NUM_THREADS=1 python -m sim.isaac.tabletop_score --scene table41.json --run runs/table41
 python -m sim.isaac.tabletop_video --scene table41.json --run runs/table41 --speed 2 --out table41-2x.mp4
@@ -179,13 +179,13 @@ Install the CUDA extension and dependencies specified by the [upstream Lightning
 
 For upright side grasps, add `--tabletop --power-contact --upright-wrap --side-placements` to the generator. It samples the object's side walls, aligns them with the central hand surface and supplies the palm contact in the same object coordinates as the native wrench search. For objects with approximate rotational symmetry, `python -m sim.isaac.tabletop_lightning_yaw --upstream "$LIGHTNING_GRASP" --hand "$HAND/sharpa.urdf" --meshes "$FUSED"/dense/*.ply --banks "$BANK" --out "$YAW"` checks rotations against the scan, projects each contact back onto the surface, and reruns native wrench scoring, contact IK and collision checks. Merge the resulting banks before launching Isaac.
 
-During approach, both the Cartesian planner and its joint-space alternatives check the thumb side and the wrist-to-knuckles axis throughout the path. At closure, the predicted thumb pad must be at least 4 mm higher than the four other pad centers on average. For bodies tall and wide enough for a power grasp, the planner checks the central palm gap and coverage by each finger. It tries reachable palm-and-four-finger candidates first, then palm-and-three and opposed multi-digit grips. The selected tier, palm seating travel and native row appear in `events.jsonl`. Actual palm load, finger load, rotation from park and bottom clearance are evaluated separately from the physical recording.
+During approach, both the Cartesian planner and its joint-space alternatives check the thumb side and the wrist-to-knuckles axis throughout the path. Power grasps require the predicted thumb pad to sit at least 4 mm above the mean of the other four pads. With adaptive execution, small or low objects allow up to 14 mm below that mean while ranking favors thumb-up poses. For bodies tall and wide enough for a power grasp, the planner checks the central palm gap and coverage by each finger. It tries reachable palm-and-four-finger candidates first, then palm-and-three and opposed multi-digit grips. The selected tier, palm seating travel and native row appear in `events.jsonl`. Actual palm load, finger load, rotation from park and bottom clearance are evaluated separately from the physical recording.
 
 Place the generated `fused_metric` directory alongside `real2sim_0417` under `RUA_SIM_ASSETS`. The following commands build a scattered layout from the hash-pinned objects and execute it.
 
 ```bash
 python -m sim.isaac.tabletop_layout --base "$REFERENCE_SCENE" --objects "$FUSED/objects.json" --aliases "$FUSED/aliases.json" --seed 3141 --out "$SCENE"
-"$ISAAC_PYTHON" -m sim.isaac.tabletop_native --scene "$SCENE" --library "$FUSED/registry.json" --hands both --camera-mode head --wrist-hardware removed --lightning-candidates "$BANK" --lift-height-m 0.05 --headless --out "$RUN"
+"$ISAAC_PYTHON" -m sim.isaac.tabletop_native --scene "$SCENE" --library "$FUSED/registry.json" --hands both --camera-mode head --wrist-hardware removed --adaptive-grasps --lightning-candidates "$BANK" --lift-height-m 0.05 --headless --out "$RUN"
 python -m sim.isaac.tabletop_score --scene "$SCENE" --run "$RUN"
 ```
 
@@ -193,11 +193,11 @@ The head depth registers the object, then the planner places the native palm pos
 
 ### Head-only adaptive grasps on a scattered table
 
-Add `--adaptive-grasps` to the native tabletop command above. Put the shared 36-posture file named by the registry beside the registry. The D455 provides the table plane, near edge, object observations and lift checks. For low objects, registration tests support faces from the metric hull against the current depth map to account for rolling after placement. The forearm and flange CAD are checked along the interpolated path. The opposite arm can take over a target that its partner could not close on. Each attempt has a unique episode index and a physical hand in `attempt_hands`.
+The default solver searches for a `native/` bank next to the registry, under its `assets/` directory, then under `RUA_SIM_ASSETS`. Use `--lightning-candidates` to specify another directory. Every target and retry uses the bank for its registered metric mesh and active hand. After that bank is exhausted the controller records the failure. Each completed closure records the bank SHA256, selected row, source and source row. The mesh registry suffices for this mode. The `--adaptive-grasps` option enables tabletop perception, path checks and hand reassignment. The D455 provides the table plane, near edge, object observations and lift checks. For low objects, registration tests support faces from the metric hull against the current depth map to account for rolling after placement. The forearm and flange CAD are checked along the interpolated path. The opposite arm can take over a target that its partner could not close on. Each attempt has a unique episode index and a physical hand in `attempt_hands`.
 
-For tall cylinders the solver measures the waist, places the central palm patch against the wall and fits each digit's pad and inner phalanx to that radius. When the upper wall narrows, the solver samples seven grip heights and recomputes the local centre and radius from the registered mesh. This helps the four fingers close around a bottle shoulder. Two station-validated `1_Large_Diameter` joint commands initialize the fit. The hand stages distal flexion, thumb opposition and proximal closure. Before lifting, fixed-palm differential IK shifts the five opposed pad targets and their inner phalanx targets 9 mm toward the palm while the wrist advances 6 mm. The targets keep their relative spacing. The controller keeps issuing the resulting joint commands through the test lift and hold. During the lift it can rotate about the grasped region to raise the thumb side when the path permits.
+To reproduce the earlier mixed-solver results, add `--hybrid-grasps` to the command and place the shared 36-posture file specified in the registry beside it. In this comparison mode, for tall cylinders the solver measures the waist, places the central palm patch against the wall and fits each digit's pad and inner phalanx to that radius. When the upper wall narrows, the solver samples seven grip heights and recomputes the local centre and radius from the registered mesh. This helps the four fingers close around a bottle shoulder. Two station-validated `1_Large_Diameter` joint commands initialize the fit. The hand stages distal flexion, thumb opposition and proximal closure. Before lifting, fixed-palm differential IK shifts the five opposed pad targets and their inner phalanx targets 9 mm toward the palm while the wrist advances 6 mm. The targets keep their relative spacing. The controller keeps issuing the resulting joint commands through the test lift and hold. During the lift it can rotate about the grasped region to raise the thumb side when the path permits.
 
-For other shapes the planner tries the Lightning Grasp bank, then measured opposing sections and reachable arm orientations. The event file records the source for each selected pose. When the 22 mm visual probe is occluded, the controller can complete the bounded lift and check the object again. After release it can reacquire a rolled object by matching a fresh depth component to its metric mesh.
+For other shapes the hybrid planner tries the Lightning Grasp bank, then measured opposing sections and reachable arm orientations. The event file records the source for each selected pose. When the 22 mm visual probe is occluded, the controller can complete the bounded lift and check the object again. After release it can reacquire a rolled object by matching a fresh depth component to its metric mesh.
 
 `confirmed_closures` counts distinct targets with a completed closing command. For older recordings the subsequent test-lift event also confirms completion. The independent audit evaluates the target's rise, bottom clearance, relative drift and contact during the hold. `four_and_palm_hold_fraction` measures the fraction of all hold samples in which the central palm and each of the four non-thumb digits individually exceed 0.25 N. `full_palm_held_2s` requires this simultaneous loading at every physics sample in the final two seconds of a verified hold. `actual_thumb_above_four_median_m` measures thumb-pad height relative to the mean height of the other four pads.
 

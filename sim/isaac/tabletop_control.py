@@ -124,12 +124,14 @@ class Controller:
         lift_height=0.05,
         lightning=None,
         adaptive=False,
+        hybrid_grasps=False,
     ):
         self.io, self.library, self.out = io, library, out
         self.side = getattr(io, "side", "right")
         self.models = Models(library, mirror=self.side == "left", rest_faces=adaptive)
         self.lightning = lightning
         self.adaptive = adaptive
+        self.hybrid_grasps = hybrid_grasps
         self.shared = shared
         if not 0.03 <= lift_height <= 0.20:
             raise ValueError("expected a lift goal between 0.03 and 0.20 metres")
@@ -966,14 +968,14 @@ class Controller:
         )
 
     def fit_registered(self, name, family, refined, reg, seeds, prior_postures, others):
+        if self.lightning is not None and not self.hybrid_grasps:
+            return self.lightning.select(
+                self, name, refined, reg, others, prior_postures
+            )
         if self.adaptive:
             from .tabletop_adaptive import select
 
             return select(self, name, refined, reg, others, prior_postures)
-        if self.lightning is not None:
-            return self.lightning.select(
-                self, name, refined, reg, others, prior_postures
-            )
         best = None
         # After a failed contact or when a transferred hand shape is unreachable,
         # refit the catalog's thumb/finger pads to the new measured contact band.
@@ -1262,11 +1264,13 @@ class Controller:
         qo, qt, qc = [np.asarray(seed[k]) for k in ("q_open", "q_touch", "q_tight")]
         first = self.io.fk(PALM)
         close_started = False
+        source = {"origin": seed["origin"], **seed.get("lightning_candidate", {})}
         try:
             self.event(
                 "close",
                 posture=seed["posture"],
                 visual_center=surface.world.mean(0).tolist(),
+                **source,
             )
             close_started = True
             sites = []
@@ -1320,7 +1324,7 @@ class Controller:
                 self.closing(grasp, qt, 0.72)
                 self.closing(tight, qc, 0.46)
                 self.hold(0.22)
-            self.event("closure_completed", posture=seed["posture"])
+            self.event("closure_completed", posture=seed["posture"], **source)
             palm0 = self.io.fk(PALM)
             first = palm0
             if not self.template_comparison:

@@ -2,10 +2,46 @@
 
 import argparse
 import json
+import os
 import traceback
 from pathlib import Path
 
 import numpy as np
+
+
+def grasp_source(args):
+    if args.library is None:
+        raise ValueError("--library is required for a grasp trial")
+    if args.mesh_grasps or args.template_comparison:
+        if args.lightning_candidates:
+            raise ValueError(
+                "a Lightning bank conflicts with an explicit mesh or template comparison"
+            )
+        if args.template_comparison:
+            if args.adaptive_grasps:
+                raise ValueError(
+                    "the fixed-template comparison uses the historical executor"
+                )
+            return "template_comparison", None
+        return ("adaptive_mesh" if args.adaptive_grasps else "mesh_fit"), None
+    if args.hybrid_grasps and not args.adaptive_grasps:
+        raise ValueError("--hybrid-grasps requires --adaptive-grasps")
+    bank = args.lightning_candidates
+    if bank is None:
+        folders = [
+            args.library.parent / "native",
+            args.library.parent / "assets" / "native",
+        ]
+        if base := os.environ.get("RUA_SIM_ASSETS"):
+            folders.append(Path(base) / "native")
+        bank = next((directory for directory in folders if directory.is_dir()), None)
+    if bank is None or not bank.is_dir():
+        raise ValueError(
+            "the Lightning Grasp bank directory was not found; pass --lightning-candidates"
+        )
+    return (
+        "adaptive_mesh_and_lightning" if args.hybrid_grasps else "lightning_grasp"
+    ), bank.resolve()
 
 
 def main():
@@ -18,7 +54,16 @@ def main():
     parser.add_argument(
         "--adaptive-grasps",
         action="store_true",
-        help="use mesh-conditioned wall envelopes, oblique opposition and hand reassignment",
+        help="enable tabletop registration, path checks, local replanning and hand reassignment",
+    )
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument(
+        "--hybrid-grasps",
+        action="store_true",
+        help="reproduce the mixed Lightning/mesh solver used in the historical comparison",
+    )
+    source.add_argument(
+        "--mesh-grasps", action="store_true", help="replay the geometric mesh solver"
     )
     parser.add_argument("--observe-only", action="store_true")
     parser.add_argument("--camera-mode", choices=("head", "head-wrist"), default="head")
@@ -47,13 +92,18 @@ def main():
         action="append",
         help="visit a named target while all scene objects remain active",
     )
-    parser.add_argument(
+    source.add_argument(
         "--template-comparison",
         action="store_true",
         help="replay the fixed-posture comparison",
     )
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
+    if not args.observe_only:
+        try:
+            solver, bank_path = grasp_source(args)
+        except ValueError as error:
+            parser.error(str(error))
     hardware = args.wrist_hardware or (
         "removed" if args.camera_mode == "head" else "mounted"
     )
@@ -99,17 +149,17 @@ def main():
                 from .tabletop_control import Controller
                 from .tabletop_lightning import LightningBank
 
-                if args.library is None:
-                    parser.error("--library is required for a grasp trial")
                 spec, shared = load_registry(
                     args.library,
                     args.template_comparison,
-                    load_postures=args.adaptive_grasps
-                    or args.lightning_candidates is None,
+                    load_postures=solver != "lightning_grasp",
                 )
-                if args.adaptive_grasps and shared is None:
+                if (
+                    solver in ("adaptive_mesh", "adaptive_mesh_and_lightning")
+                    and shared is None
+                ):
                     parser.error(
-                        "--adaptive-grasps requires a metric registry and its shared posture catalog"
+                        "adaptive mesh synthesis requires a metric registry and its shared posture catalog"
                     )
                 (out / "trial_settings.json").write_text(
                     json.dumps(
@@ -121,11 +171,8 @@ def main():
                             "hands": sides,
                             "camera_mode": args.camera_mode,
                             "wrist_hardware": hardware,
-                            "solver": "adaptive_mesh_and_lightning"
-                            if args.adaptive_grasps
-                            else "lightning_grasp"
-                            if args.lightning_candidates
-                            else "mesh_fit",
+                            "solver": solver,
+                            "adaptive_grasps": args.adaptive_grasps,
                             "mount_installed": scene.fixture_path is not None,
                         }
                     )
@@ -133,11 +180,7 @@ def main():
                 controllers = []
                 for i, side in enumerate(sides):
                     device = io if i == 0 else connect(scene, out, side, audit)[0]
-                    bank = (
-                        LightningBank(args.lightning_candidates, side)
-                        if args.lightning_candidates
-                        else None
-                    )
+                    bank = LightningBank(bank_path, side) if bank_path else None
                     controllers.append(
                         Controller(
                             device,
@@ -148,6 +191,7 @@ def main():
                             args.lift_height_m,
                             bank,
                             args.adaptive_grasps,
+                            hybrid_grasps=args.hybrid_grasps,
                         )
                     )
                 targets = list(args.target or spec)

@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from sim.isaac.paths import RIGHT_JOINTS
-from sim.isaac.tabletop_control import Controller
+from sim.isaac.tabletop_control import Controller, NoPath
 from sim.isaac.tabletop_lightning import LightningBank, central_palm_samples
 from sim.isaac.tabletop_lightning_banks import merge
 
@@ -101,6 +101,75 @@ def test_lightning_registry_needs_only_metric_mesh(tmp_path):
         json.dumps({"schema": "rua.tabletop-geometries.v1", "objects": objects})
     )
     assert load_registry(registry, load_postures=False) == (objects, None)
+
+
+def test_default_entry_requires_lightning_bank_and_accepts_explicit_comparisons(
+    tmp_path, monkeypatch
+):
+    from sim.isaac.tabletop_native import grasp_source
+
+    monkeypatch.delenv("RUA_SIM_ASSETS", raising=False)
+    args = SimpleNamespace(
+        library=tmp_path / "registry.json",
+        lightning_candidates=None,
+        adaptive_grasps=True,
+        hybrid_grasps=False,
+        mesh_grasps=False,
+        template_comparison=False,
+    )
+    with pytest.raises(ValueError, match="Lightning Grasp bank"):
+        grasp_source(args)
+    bank = tmp_path / "native"
+    bank.mkdir()
+    assert grasp_source(args) == ("lightning_grasp", bank)
+    args.hybrid_grasps = True
+    assert grasp_source(args) == ("adaptive_mesh_and_lightning", bank)
+    args.hybrid_grasps = False
+    args.mesh_grasps = True
+    assert grasp_source(args) == ("adaptive_mesh", None)
+    args.lightning_candidates = bank
+    with pytest.raises(ValueError, match="conflicts"):
+        grasp_source(args)
+
+
+@pytest.mark.parametrize("name", ["bottle", "carrot"])
+def test_adaptive_execution_uses_only_lightning_through_retry(name, monkeypatch):
+    from sim.isaac import tabletop_adaptive
+
+    def select(ctrl, target, surface, reg, obstacles, previous):
+        assert target == name
+        if previous:
+            raise NoPath("native candidates exhausted")
+        return {"posture": "LG-4"}, {}
+
+    monkeypatch.setattr(
+        tabletop_adaptive, "select", lambda *args: pytest.fail("geometric fallback")
+    )
+    ctrl = Controller.__new__(Controller)
+    ctrl.lightning = SimpleNamespace(select=select)
+    ctrl.adaptive = True
+    ctrl.hybrid_grasps = False
+    assert (
+        ctrl.fit_registered(name, None, None, None, [], [], None)[0]["posture"]
+        == "LG-4"
+    )
+    with pytest.raises(NoPath, match="native candidates exhausted"):
+        ctrl.fit_registered(name, None, None, None, [], ["LG-4"], None)
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_adaptive_mesh_and_explicit_hybrid_still_use_mesh_selector(hybrid, monkeypatch):
+    from sim.isaac import tabletop_adaptive
+
+    ctrl = Controller.__new__(Controller)
+    ctrl.lightning = object() if hybrid else None
+    ctrl.hybrid_grasps = hybrid
+    ctrl.adaptive = True
+    monkeypatch.setattr(tabletop_adaptive, "select", lambda *args: ("comparison", {}))
+    assert ctrl.fit_registered("item", None, None, None, [], [], None) == (
+        "comparison",
+        {},
+    )
 
 
 def test_canonical_hand_allows_upright_park_and_rejects_inverted_transit():
