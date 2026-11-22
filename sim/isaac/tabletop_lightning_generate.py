@@ -231,7 +231,7 @@ def palm_condition_in_object_frame(poses, condition):
     )
 
 
-def batch(api, torch, ctx, obj, args, ncontact):
+def batch(api, torch, ctx, obj, args, ncontact, placement_sampler=sample_placements):
     (
         robot,
         tree,
@@ -251,7 +251,7 @@ def batch(api, torch, ctx, obj, args, ncontact):
     ]
     valid = api.get_support_point_mask(all_pts, all_normals, [0.01])[0]
     pts, normals = all_pts[valid], all_normals[valid]
-    poses, condition = sample_placements(
+    poses, condition = placement_sampler(
         api, torch, robot, field, tree, static, pts, normals, obj, args
     )
     log = {"placements": len(poses), "requested_digits": ncontact}

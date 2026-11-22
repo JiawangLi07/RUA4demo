@@ -38,6 +38,24 @@ def swept_clear(stations, free):
     return True
 
 
+def wrap_entry_frames(tight):
+    return shifted(tight, -0.015 * tight[:3, 0]), shifted(tight, -0.003 * tight[:3, 0])
+
+
+def seating_frames(start, end):
+    translation = np.linalg.norm(end[:3, 3] - start[:3, 3])
+    angle = Rotation.from_matrix(start[:3, :3].T @ end[:3, :3]).magnitude()
+    count = max(1, int(np.ceil(translation / 0.009)), int(np.ceil(angle / 0.10)))
+    interpolation = Slerp(
+        [0.0, 1.0], Rotation.from_matrix([start[:3, :3], end[:3, :3]])
+    )
+    for f in np.linspace(0, 1, count + 1)[1:]:
+        frame = np.eye(4)
+        frame[:3, :3] = interpolation(f).as_matrix()
+        frame[:3, 3] = start[:3, 3] + f * (end[:3, 3] - start[:3, 3])
+        yield float(f), frame
+
+
 class ArmIK:
     """Bounded seven-axis IK with the geometric Jacobian from the station URDF."""
 
@@ -109,7 +127,15 @@ class ArmIK:
         )
         r = result.fun
         if np.linalg.norm(r[:3]) > 0.0035 or np.linalg.norm(r[3:]) > 0.009:
-            raise NoPath("arm IK")
+            error = NoPath("arm IK")
+            error.residual = (
+                float(np.linalg.norm(r[:3])),
+                float(np.linalg.norm(r[3:]) / 0.20),
+            )
+            error.bound_joints = np.flatnonzero(
+                np.minimum(result.x - self.bounds[0], self.bounds[1] - result.x) < 0.002
+            ).tolist()
+            raise error
         return result.x
 
 
@@ -407,6 +433,7 @@ class Controller:
         protected=None,
         object_margin=0.0025,
         endpoint_check=None,
+        plan_only=False,
     ):
         start = self.io.fk(PALM)
         initial = self.arm.copy()
@@ -605,6 +632,8 @@ class Controller:
                     joints = None
             if joints is None:
                 raise NoPath("no clear arm path")
+        if plan_only:
+            return joints
         length = np.sum(np.max(np.abs(np.diff(joints, axis=0)), axis=1))
         # A smoothstep peaks at 1.5 times mean speed during the moving 84% of
         # the command. Bound the nominal velocity before entering observed clutter.
@@ -660,31 +689,51 @@ class Controller:
 
     def check_closure_path(self, origin, arm, grasp, tight):
         goals = []
-        if origin in ("head_wall_envelope", "lightning_grasp"):
-            standoff = 0.012 if origin == "head_wall_envelope" else 0.009
-            goals.append(shifted(grasp, -standoff * grasp[:3, 0]))
-        goals.extend((grasp, tight))
+        if origin == "seated_wrap":
+            seat, near = wrap_entry_frames(tight)
+            goals.extend((("seat", seat), ("opposition", near), ("tighten", tight)))
+        elif origin == "power_wrap":
+            goals.extend(
+                (
+                    ("native_entry", grasp),
+                    ("seat", shifted(tight, -0.012 * tight[:3, 0])),
+                    ("opposition", shifted(tight, -0.003 * tight[:3, 0])),
+                    ("tighten", tight),
+                )
+            )
+        else:
+            if origin in ("head_wall_envelope", "lightning_grasp"):
+                standoff = 0.012 if origin == "head_wall_envelope" else 0.009
+                goals.append(("seat", shifted(grasp, -standoff * grasp[:3, 0])))
+            goals.extend((("grasp", grasp), ("tighten", tight)))
         carry_pose = tight
-        if origin == "head_wall_envelope":
+        if origin in ("head_wall_envelope", "power_wrap", "seated_wrap"):
             carry_pose = shifted(tight, 0.006 * tight[:3, 0])
-            goals.append(carry_pose)
+            goals.append(("preload", carry_pose))
         goals.extend(
-            shifted(carry_pose, [0, 0, dz]) for dz in (0.022, self.lift_travel)
+            (step, shifted(carry_pose, [0, 0, dz]))
+            for step, dz in (("probe", 0.022), ("lift", self.lift_travel))
         )
         path = [arm]
-        for goal in goals:
-            path.append(self.ik.solve(goal, path[-1]))
+        for stage, goal in goals:
+            try:
+                path.append(self.ik.solve(goal, path[-1]))
+            except NoPath as error:
+                error.stage = stage + "_ik"
+                raise
 
         def free(q, _):
             palm = self.ik.fk(q)
-            return (
-                self.arm_above_table(q)
-                and self.fixture_clear(palm)
-                and self.approach_orientation_clear(palm)
-            )
+            if not self.arm_above_table(q):
+                raise NoPath(stage + "_sweep_forearm")
+            if not self.fixture_clear(palm):
+                raise NoPath(stage + "_sweep_flange")
+            if not self.approach_orientation_clear(palm):
+                raise NoPath(stage + "_sweep_orientation")
+            return True
 
-        if not swept_clear(path, free):
-            raise NoPath("forearm, flange or orientation along approach-to-lift path")
+        for (stage, _), (start, end) in zip(goals, pairwise(path)):
+            swept_clear([start, end], free)
 
     def coarse_surface(self, name, observed):
         from .head_wrist_surface import RegisteredSurface
@@ -1202,13 +1251,22 @@ class Controller:
     def approach(self, seed, poses, surface, others):
         pre, grasp, tight = [poses[k] for k in ("pre", "grasp", "tight")]
         qo, qt = [np.asarray(seed[k]) for k in ("q_open", "q_touch")]
-        if not self.clear(pre, qo, others) or not self.clear(grasp, qt, others):
+        entry, entry_hand = grasp, qt
+        if seed.get("closure_mode") == "seated_wrap":
+            entry = wrap_entry_frames(tight)[0]
+            entry_hand = seed["seated_q"]
+        if not self.clear(pre, qo, others) or not self.clear(entry, entry_hand, others):
             raise NoPath("registered target invalidated clearance")
         endpoint_check = None
         if self.adaptive:
 
             def endpoint_check(arm):
-                self.check_closure_path(seed["origin"], arm, grasp, tight)
+                self.check_closure_path(
+                    seed.get("closure_mode") or seed["origin"],
+                    arm,
+                    grasp,
+                    tight,
+                )
         elif seed["origin"] == "lightning_grasp":
 
             def endpoint_check(arm):
@@ -1274,29 +1332,61 @@ class Controller:
             )
             close_started = True
             sites = []
-            if seed["origin"] == "lightning_grasp":
+            power_wrap = (
+                seed.get("power_wrap") or seed["origin"] == "head_wall_envelope"
+            )
+            if seed["origin"] == "lightning_grasp" and not power_wrap:
                 # Seat the open hand before applying the native joint solution.
                 seat = shifted(grasp, -0.009 * grasp[:3, 0])
                 self.closing(seat, qo, 0.48)
                 self.closing(grasp, qt, 0.65)
                 self.closing(tight, qc, 0.42)
                 self.hold(0.20)
-            elif seed["origin"] == "head_wall_envelope":
+            elif power_wrap:
                 from .paths import RIGHT_JOINTS
 
-                # Spread the thumb across the near flank, curl the distal joints
-                # first, then draw all four proximal phalanges against the wall.
-                hooked = qo.copy()
-                tips = np.array([n.endswith(("_PIP", "_DIP")) for n in RIGHT_JOINTS])
-                hooked[tips] += 0.52 * (qt[tips] - qo[tips])
-                seat = shifted(grasp, -0.012 * grasp[:3, 0])
-                self.closing(seat, hooked, 0.68)
-                opposed = hooked + 0.44 * (qt - hooked)
-                opposed[:5] = qo[:5] + 0.76 * (qt[:5] - qo[:5])
-                self.closing(grasp, opposed, 0.68)
-                self.closing(tight, qt, 0.65)
-                self.closing(tight, qc, 0.35)
-                self.hold(0.18)
+                seated_q = seed.get("seated_q")
+                if seated_q is not None:
+                    # Keep all fingers outside the object until the palm reaches
+                    # the near wall, then oppose the thumb across that wall.
+                    tips = np.array(
+                        [n.endswith(("_PIP", "_DIP")) for n in RIGHT_JOINTS]
+                    )
+                    hooked = qo.copy()
+                    hooked[tips] += 0.52 * (seated_q[tips] - qo[tips])
+                    seat, near = wrap_entry_frames(tight)
+                    self.closing(seat, hooked, 0.68)
+                    opposed = hooked + 0.44 * (seated_q - hooked)
+                    opposed[:5] = qo[:5] + 0.76 * (seated_q[:5] - qo[:5])
+                    self.closing(near, opposed, 0.63)
+                    # The native anchor solution at this wrist supplies the
+                    # direction of the final finger travel. Follow under load
+                    # with a bounded motor target on the measured cross section.
+                    knots = seed.get("seating_knots", [])
+                    projected = knots[-1][1] if knots else qt
+                    first_touch = seated_q + 0.16 * np.clip(
+                        projected - seated_q, -0.45, 0.45
+                    )
+                    self.closing(tight, first_touch, 0.59)
+                    self.event(
+                        "native_targets_seated", posture=seed["posture"], **source
+                    )
+                    self.closing(tight, qc, 0.36)
+                    self.hold(0.18)
+                else:
+                    hooked = qo.copy()
+                    tips = np.array(
+                        [n.endswith(("_PIP", "_DIP")) for n in RIGHT_JOINTS]
+                    )
+                    hooked[tips] += 0.52 * (qt[tips] - qo[tips])
+                    seat = shifted(grasp, -0.012 * grasp[:3, 0])
+                    self.closing(seat, hooked, 0.68)
+                    opposed = hooked + 0.44 * (qt - hooked)
+                    opposed[:5] = qo[:5] + 0.76 * (qt[:5] - qo[:5])
+                    self.closing(grasp, opposed, 0.68)
+                    self.closing(tight, qt, 0.65)
+                    self.closing(tight, qc, 0.35)
+                    self.hold(0.18)
             elif seed["origin"] == "wrist_handle_cross_sections":
                 from .tabletop_handle import seat, surround_handle
 
@@ -1330,7 +1420,7 @@ class Controller:
             if not self.template_comparison:
                 self.begin_lift(surface)
             carry = self.hand.copy()
-            if seed["origin"] == "head_wall_envelope":
+            if power_wrap:
                 # Compensate finger compliance on the wall while seating the
                 # palm. Keep this motor target through the probe and final lift.
                 upper = self.io.model.limits["right"][:, 1]
@@ -1342,8 +1432,62 @@ class Controller:
                         carry[j] = min(upper[j], carry[j] + preload)
                 from .tabletop_adaptive import draw_pads_to_palm
 
-                carry = draw_pads_to_palm(self, carry, 0.009)
-                self.closing(shifted(palm0, 0.006 * palm0[:3, 0]), carry, 0.52)
+                squeeze = 0.006
+                advance = np.zeros(3)
+                digit_offsets = None
+                if seed.get("seated_q") is not None:
+                    from .tabletop_handle import reobserve
+                    from .tabletop_lightning import central_palm_samples
+
+                    new_surface, new_pose = reobserve(
+                        self, surface, pose, tag="seated_wrap_head"
+                    )
+                    # A consistent head-registered lateral shift locates the
+                    # object after seating. Avoid following a large outlier.
+                    measured = new_pose[:3, 3] - pose[:3, 3]
+                    if np.linalg.norm(measured[:2]) <= 0.018:
+                        advance[:2] = 0.70 * measured[:2]
+                        surface, pose = new_surface, new_pose
+                    patch = central_palm_samples(self.io.model.hand_support[PALM])
+                    rel = np.linalg.solve(pose, palm0)
+                    gaps = surface.tree.query(patch @ rel[:3, :3].T + rel[:3, 3])[0]
+                    squeeze = float(
+                        np.clip(0.005 + np.quantile(gaps, 0.15), 0.006, 0.012)
+                    )
+                    digit_offsets = {
+                        digit: np.array([-0.005, 0.0, -0.003])
+                        for digit, explicit in zip(
+                            ("thumb", "index", "middle", "ring", "pinky"),
+                            seed["explicit_digits"],
+                        )
+                        if not explicit
+                    }
+                    self.event(
+                        "wrap_head_pressure",
+                        head_shift_m=measured.tolist(),
+                        palm_seat_m=squeeze,
+                        unconstrained_digits=list(digit_offsets),
+                    )
+                carry = draw_pads_to_palm(
+                    self,
+                    carry,
+                    0.011 if digit_offsets is not None else 0.009,
+                    digit_offsets,
+                )
+                default = 0.006 * palm0[:3, 0]
+                requested = advance + squeeze * palm0[:3, 0]
+                for fraction in (1.0, 0.5, 0.0):
+                    dest = shifted(palm0, default + fraction * (requested - default))
+                    if not self.clear(dest, carry, others):
+                        continue
+                    try:
+                        self.lift_ik(dest, self.arm)
+                        self.closing(dest, carry, 0.56)
+                    except NoPath:
+                        continue
+                    break
+                else:
+                    self.closing(palm0, carry, 0.52)
                 palm0 = self.io.fk(PALM)
                 first = palm0
             if sites:
@@ -1373,6 +1517,30 @@ class Controller:
                 verdict = self.vote(
                     surface, pose, palm0, observed["color"], "test_observation_repeat"
                 )
+            if seed.get("seated_q") is not None and verdict == "carried":
+                free = {
+                    d: np.array([-0.004, 0.0, -0.003])
+                    for d, has in zip(
+                        ("thumb", "index", "middle", "ring", "pinky"),
+                        seed["explicit_digits"],
+                    )
+                    if not has
+                }
+                if free:
+                    from .tabletop_adaptive import draw_pads_to_palm
+
+                    held = self.io.fk(PALM)
+                    supported = draw_pads_to_palm(self, self.hand, 0.0, free)
+                    if self.clear(held, supported, others):
+                        try:
+                            self.closing(held, supported, 0.30)
+                            self.event(
+                                "wrap_probe_pressure",
+                                palm_advance_m=0.0,
+                                free_digits=list(free),
+                            )
+                        except NoPath:
+                            pass
             if verdict != "carried":
                 # When the closing hand masks the object, static/raised mesh
                 # hypotheses can be visually indistinguishable at 22 mm. Allow
@@ -1387,10 +1555,12 @@ class Controller:
                     return verdict
                 self.event("continue_visual_probe", initial_vote=verdict)
             top = shifted(palm0, [0, 0, self.lift_travel])
-            if seed["origin"] == "head_wall_envelope":
+            if power_wrap:
                 from .tabletop_adaptive import thumb_up_carry
 
-                upright = thumb_up_carry(self, top, qt)
+                upright = thumb_up_carry(
+                    self, top, qt if seed.get("seated_q") is None else seed["seated_q"]
+                )
                 try:
                     if not self.clear(upright, self.hand, others):
                         raise NoPath("no clearance for a thumb-up carry")

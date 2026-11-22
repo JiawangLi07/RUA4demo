@@ -472,3 +472,120 @@ def test_tapered_wall_uses_the_radius_at_each_grasp_height(monkeypatch):
     tapered = radii_by_level(0.031 - 0.026 * np.clip((z / 0.16 - 0.35) / 0.65, 0, 1))
     assert {0.46, 0.52, 0.55} <= tapered.keys()
     assert tapered[0.58] < tapered[0.49]
+
+
+def test_reach_diagnostic_separates_final_lift_ik_from_swept_forearm():
+    c = Controller.__new__(Controller)
+    c.lift_travel = 0.067
+    c.fixture_clear = c.approach_orientation_clear = lambda palm: True
+    c.arm_above_table = lambda q: True
+
+    def solve(goal, q):
+        if goal[2, 3] > 0.06:
+            err = NoPath("arm IK")
+            err.residual = (0.005, 0.025)
+            raise err
+        return q + 0.1
+
+    c.ik = SimpleNamespace(solve=solve, fk=lambda q: np.eye(4))
+    with pytest.raises(NoPath) as failure:
+        c.check_closure_path("lightning_grasp", np.zeros(7), np.eye(4), np.eye(4))
+    assert failure.value.stage == "lift_ik" and failure.value.residual == (0.005, 0.025)
+    c.ik.solve = lambda goal, q: q + 0.1
+    c.arm_above_table = lambda q: q[0] < 0.03
+    with pytest.raises(NoPath, match="native_entry_sweep_forearm"):
+        c.check_closure_path("power_wrap", np.zeros(7), np.eye(4), np.eye(4))
+
+
+def test_export_filters_unreachable_rows_before_writing_native_placements(
+    tmp_path, monkeypatch
+):
+    from sim.isaac import tabletop_lightning_reach as reach
+    from scipy.spatial.transform import Rotation
+
+    reg = np.eye(4)
+    reg[:3, :3] = Rotation.from_euler("z", 39, degrees=True).as_matrix()
+    reg[:3, 3] = [0.34, 0.15, 0.12]
+    c = SimpleNamespace(
+        side="right",
+        arm=np.zeros(7),
+        table=0.01,
+        table_front_x=0.1,
+        library={
+            "item": {
+                "prior": {
+                    "sha256": "prior",
+                    "lightning_input_sha256": {"right": "scan"},
+                }
+            }
+        },
+        clear=lambda *a: True,
+        link_shapes=lambda q: {},
+        event=lambda *a, **kw: None,
+        ik=SimpleNamespace(solve=lambda pre, seed: np.zeros(7)),
+    )
+
+    def validate(_, q, palm, tight):
+        if palm[0, 3] < 0.1:
+            raise NoPath("seat_sweep_forearm")
+
+    c.check_closure_path = validate
+    mesh = SimpleNamespace(
+        local=np.array(
+            [
+                [x, y, z]
+                for x in [-0.03, 0.03]
+                for y in [-0.03, 0.03]
+                for z in [-0.09, 0.09]
+            ]
+        ),
+        clear=lambda *args: True,
+    )
+    card = dict(q_open=np.zeros(22), q_touch=np.ones(22), q_tight=np.ones(22))
+    live = np.eye(4)
+    live[:3, 3] = [0.31, 0.28, 0.18]
+    pre = live.copy()
+    pre[0, 3] -= 0.05
+
+    def cards(ctrl, surface):
+        for cost, p in enumerate((np.eye(4), live)):
+            yield cost, card, {"pre": pre, "grasp": p, "tight": p}
+
+    monkeypatch.setattr(reach, "wall_grasps", cards)
+    monkeypatch.setattr(reach, "nearest_arm", lambda *_: (0, np.zeros((1, 7))))
+    reach.checked_placements(c, "item", mesh, reg, None, tmp_path)
+    with np.load(tmp_path / "item.right.npz") as z:
+        assert len(z["object_pose"]) == 1
+        placed = reg @ np.linalg.inv(z["object_pose"][0])
+        assert np.allclose(placed, live)
+        assert np.allclose(placed @ z["pre_in_palm"][0], pre)
+
+    # A trial can still fail after the palm and every discrete grasp goal are
+    # reachable. Reject that placement during export, before CUDA samples it.
+    c.hints = {}
+    c.move = lambda *args, **kwargs: [np.zeros(7)]
+    c.fixture_clear = c.approach_orientation_clear = lambda _: True
+    tested = []
+
+    def reject_seat(mode, arm, palm, tight):
+        tested.append(mode)
+        if mode == "seated_wrap":
+            raise NoPath("seat_sweep_forearm")
+
+    c.check_closure_path = reject_seat
+    with pytest.raises(NoPath, match="no continuous arm motion"):
+        reach.checked_domain(
+            c, "item", mesh, reg, None, tmp_path / "domain", tmp_path, None, limit=1
+        )
+    assert "power_wrap" in tested and "seated_wrap" in tested
+    assert not (tmp_path / "domain" / "item.right.npz").exists()
+
+    c.check_closure_path = lambda *args: None
+    reach.checked_domain(
+        c, "item", mesh, reg, None, tmp_path / "domain", tmp_path, None, limit=1
+    )
+    with np.load(tmp_path / "domain" / "item.right.npz") as z:
+        assert z["seated_path"].tolist() == [True]
+        assert np.allclose(
+            reg @ np.linalg.inv(z["object_pose"][0]) @ z["pre_in_palm"][0], pre
+        )

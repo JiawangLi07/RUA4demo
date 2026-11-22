@@ -65,6 +65,16 @@ def main():
     source.add_argument(
         "--mesh-grasps", action="store_true", help="replay the geometric mesh solver"
     )
+    parser.add_argument(
+        "--placement-chart",
+        type=Path,
+        help="reuse a saved arm chart when exporting the checked native placement domain",
+    )
+    parser.add_argument(
+        "--export-lightning-placements",
+        type=Path,
+        help="use head depth and arm IK to prepare fixed placements for the native contact solver",
+    )
     parser.add_argument("--observe-only", action="store_true")
     parser.add_argument("--camera-mode", choices=("head", "head-wrist"), default="head")
     parser.add_argument(
@@ -99,9 +109,27 @@ def main():
     )
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
+    if args.placement_chart and not args.export_lightning_placements:
+        parser.error("--placement-chart requires --export-lightning-placements")
+    if args.export_lightning_placements and (
+        not args.adaptive_grasps
+        or args.hands == "both"
+        or args.camera_mode != "head"
+        or not args.target
+        or args.observe_only
+        or args.hybrid_grasps
+        or args.mesh_grasps
+        or args.template_comparison
+    ):
+        parser.error(
+            "placement export requires one hand, head mode, --adaptive-grasps and an explicit target"
+        )
     if not args.observe_only:
         try:
-            solver, bank_path = grasp_source(args)
+            if args.export_lightning_placements and args.library:
+                solver, bank_path = "lightning_grasp", None
+            else:
+                solver, bank_path = grasp_source(args)
         except ValueError as error:
             parser.error(str(error))
     hardware = args.wrist_hardware or (
@@ -181,6 +209,14 @@ def main():
                 for i, side in enumerate(sides):
                     device = io if i == 0 else connect(scene, out, side, audit)[0]
                     bank = LightningBank(bank_path, side) if bank_path else None
+                    if args.export_lightning_placements:
+                        from .tabletop_lightning_reach import PlacementExport
+
+                        bank = PlacementExport(
+                            args.export_lightning_placements,
+                            args.placement_chart,
+                            args.lightning_candidates,
+                        )
                     controllers.append(
                         Controller(
                             device,
@@ -195,7 +231,16 @@ def main():
                         )
                     )
                 targets = list(args.target or spec)
-                if len(controllers) == 1:
+                if args.export_lightning_placements:
+                    ctrl = controllers[0]
+                    (out / "observations").mkdir(exist_ok=True)
+                    observed = ctrl.survey()
+                    for name in targets:
+                        if name not in observed:
+                            raise ValueError("requested object not found in head RGB-D")
+                        ctrl.name, ctrl.attempt = name, 1
+                        ctrl.geometry(name, observed[name], {"prior_postures": []})
+                elif len(controllers) == 1:
                     controllers[0].execute(targets)
                 else:
                     (out / "observations").mkdir(exist_ok=True)

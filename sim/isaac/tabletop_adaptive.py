@@ -264,12 +264,12 @@ def wall_grasps(ctrl, surface):
                     )
 
 
-def draw_pads_to_palm(ctrl, initial, distance):
+def draw_pads_to_palm(ctrl, initial, distance, digit_offsets=None):
     """Move the opposed pad targets together toward the palm without changing their spacing."""
     sites = []
     palm = np.eye(4)
-    shift = np.array([-distance, 0.0, 0.0])
     for digit in DIGITS:
+        shift = np.array([-distance, 0.0, 0.0]) + (digit_offsets or {}).get(digit, 0.0)
         inner = "PP" if digit == "thumb" else "MP"
         for suffix, weight in (("elastomer", 1.0), (inner, 0.38)):
             link = f"right_{digit}_{suffix}"

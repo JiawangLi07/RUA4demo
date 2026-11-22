@@ -201,4 +201,25 @@ For other shapes the hybrid planner tries the Lightning Grasp bank, then measure
 
 `confirmed_closures` counts distinct targets with a completed closing command. For older recordings the subsequent test-lift event also confirms completion. The independent audit evaluates the target's rise, bottom clearance, relative drift and contact during the hold. `four_and_palm_hold_fraction` measures the fraction of all hold samples in which the central palm and each of the four non-thumb digits individually exceed 0.25 N. `full_palm_held_2s` requires this simultaneous loading at every physics sample in the final two seconds of a verified hold. `actual_thumb_above_four_median_m` measures thumb-pad height relative to the mean height of the other four pads.
 
+### Reach-conditioned Lightning Grasp for bottles and tubes
+
+The wrist and forearm have to reach a continuous path around the registered object. The head-only planner first fits a cylindrical section to the metric mesh, searches the station arm's inverse kinematics and verifies the parked-arm transfer. It then checks the approach to the palm, seating, probe and lift, including the forearm and tool flange along the intervening joint trajectories. The CUDA solver samples object-to-palm transforms from this checked set. The two large-diameter entries from the station's grasp catalog initialize the section fit. Lightning Grasp's native contact field, contact search, finger IK and collision filters supply candidate contact links, surface targets and joint angles. The controller reprojects these targets at the seated wrist and fits the pad and inner phalanx of each finger to the registered wall. It approaches the near wall with open fingers, brings the thumb into opposition and continues closing under the joint drives. After seating, it rechecks reach through the probe and lift before acting on a lateral correction from head depth. The independent physics audit records each digit and the central palm throughout the hold.
+
+For a new placement, capture the arm chart and its checked domain in a single head exposure. `OBJECT` is the registry key. `DENSE` contains the metric PLY for the selected canonical hand. The output directories for the Isaac captures must be new.
+
+```bash
+common=(--scene "$SCENE" --library "$REGISTRY" --hands "$HAND" --target "$OBJECT"
+        --camera-mode head --wrist-hardware removed --adaptive-grasps
+        --lift-height-m 0.05 --headless)
+"$ISAAC_PY" -m sim.isaac.tabletop_native "${common[@]}" --out "$WORK/observe" \
+  --export-lightning-placements "$WORK/domain"
+"$LG_PY" -m sim.isaac.tabletop_lightning_field --upstream "$LIGHTNING_GRASP" \
+  --hand "$HAND_URDF" --domain "$WORK/domain" --out "$WORK/bank" \
+  --meshes "$DENSE/$OBJECT.$HAND.ply"
+"$ISAAC_PY" -m sim.isaac.tabletop_native "${common[@]}" --out "$WORK/trial" \
+  --lightning-candidates "$WORK/bank"
+```
+
+The exporter accepts an existing arm chart through `--placement-chart DIR` and rechecks it in the current observation. When native contact priors already exist for the same mesh, `--contact-priors DIR` initializes additional surface-reprojected finger solves. The arm domain and the native bank include input hashes and row identities. The executor registers a fresh head frame, checks the selected trajectory again, and keeps failure and retry frames in the recording. Each `lightning_filter` event lists failure stages per candidate and IK branch. `open_approach` counts collision-clear open-hand placements. `arm_reachable` counts placements with a verified motion through lift.
+
 Native camera frames preserve simulation time at 15 fps. To create the continuous two-camera video, run `python -m sim.isaac.tabletop_video --run "$RUN" --speed 1 --out "$VIDEO"`. For an observer close-up with time-aligned digit and palm loads, use `python -m sim.isaac.tabletop_contact_video --run "$RUN" --target "$TARGET" --crop X Y SIZE --out "$VIDEO"`. The crop is in observer-image pixels and the full frame remains visible alongside it.

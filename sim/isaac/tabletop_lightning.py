@@ -44,6 +44,95 @@ def requires_full_wrap(points):
     return bool(narrow >= 0.042 and length >= max(0.090, 2 * wide))
 
 
+def fit_pressure_pose(
+    ctrl, surface, object_from_palm, native, section_guess, constrained
+):
+    """Solve compliant motor targets at the seated wrist using the registered mesh."""
+    guess = section_guess.astype(float)
+    drive = guess.copy()
+    lower, upper = ctrl.io.model.limits["right"].T
+    center = np.median(surface.local, axis=0)
+    for digit, active in zip(
+        ("thumb", "index", "middle", "ring", "pinky"), constrained
+    ):
+        columns = np.array(
+            [
+                i
+                for i, n in enumerate(RIGHT_JOINTS)
+                if n.startswith("right_" + digit + "_")
+            ]
+        )
+        jacobians = []
+        residuals = []
+        for suffix, weight, compression in (
+            ("elastomer", 1.0, 0.003),
+            ("PP" if digit == "thumb" else "MP", 0.65, 0.002),
+        ):
+            link = f"right_{digit}_{suffix}"
+            frame, axes = ctrl.hand_contacts.link(link, object_from_palm, guess)
+            cloud = ctrl.io.model.hand_support[link] @ frame[:3, :3].T + frame[:3, 3]
+            gap, nearest = surface.tree.query(cloud)
+            band = gap <= np.quantile(gap, 0.08) + 0.0004
+            point = cloud[band].mean(0)
+            target = surface.tree.data[nearest[band]].mean(0)
+            inward = center - target
+            inward[2] = 0
+            inward /= max(1e-8, np.linalg.norm(inward))
+            J = np.zeros((3, len(RIGHT_JOINTS)))
+            for idx, axis, origin in axes:
+                J[:, idx] = np.cross(axis, point - origin)
+            jacobians.append(weight * J[:, columns])
+            residuals.append(weight * (target + compression * inward - point))
+        jacobians.append(0.012 * np.eye(len(columns)))
+        # Use the native solution to break ties between motor configurations
+        # that seat the same two patches on the scanned wall.
+        residuals.append(
+            0.012 * np.clip(native[columns] - guess[columns], -0.18, 0.18)
+            if active
+            else np.zeros(len(columns))
+        )
+        delta = np.linalg.lstsq(
+            np.vstack(jacobians), np.concatenate(residuals), rcond=None
+        )[0]
+        drive[columns] = np.clip(
+            guess[columns] + np.clip(delta, -0.14, 0.14), lower[columns], upper[columns]
+        )
+    return drive
+
+
+def seat_contact_knots(ctrl, palm, seated, native, pressure, links, anchors, goals):
+    """Follow the original native contact sites as the palm advances around the object."""
+    from .tabletop_control import seating_frames
+
+    targets = goals @ palm[:3, :3].T + palm[:3, 3]
+    low, high = ctrl.io.model.limits["right"].T
+    q = native.copy()
+    knots = []
+    for fraction, frame in seating_frames(palm, seated):
+        # Release the kinematic overconstraint from the compliant motor target:
+        # keep contacted sites stationary in the measured object frame.
+        bias = native + 0.55 * fraction * (pressure - native)
+        for _ in range(5):
+            J = []
+            residual = []
+            for name, anchor, target in zip(links, anchors, targets):
+                link, axes = ctrl.hand_contacts.link(str(name), frame, q)
+                point = link[:3, :3] @ anchor + link[:3, 3]
+                jac = np.zeros((3, len(q)))
+                for col, axis, origin in axes:
+                    jac[:, col] = np.cross(axis, point - origin)
+                J.append(jac)
+                residual.append(target - point)
+            J.append(0.008 * np.eye(len(q)))
+            residual.append(0.008 * (bias - q))
+            update = np.linalg.lstsq(
+                np.vstack(J), np.concatenate(residual), rcond=None
+            )[0]
+            q = np.clip(q + np.clip(update, -0.18, 0.18), low, high)
+        knots.append((frame, q.copy()))
+    return knots
+
+
 class LightningBank:
     def __init__(self, path, side):
         self.path, self.side = Path(path), side
@@ -84,9 +173,34 @@ class LightningBank:
                     if "candidate_source" in z
                     else np.full(len(z["q"]), "official")
                 )
+                if "source_domain_sha256" in z:
+                    data["source_domain_sha256"] = z["source_domain_sha256"]
                 data["source_id"] = (
                     z["source_id"] if "source_id" in z else np.arange(len(z["q"]))
                 )
+                if repo.get("method") in (
+                    "reachable_placement_native_five_link_contact_ik",
+                    "arm_chart_native_contact_field",
+                    "arm_chart_native_contact_refinement",
+                ):
+                    for key in (
+                        "pre_in_palm",
+                        "tight_in_palm",
+                        "arm_pre",
+                        "q_open",
+                        "cost",
+                        "warm_delta_rad",
+                        "standoff_m",
+                    ):
+                        data[key] = z[key]
+                    if "seated_path" in z:
+                        data["seated_path"] = z["seated_path"]
+                    if "contact_pos" in z:
+                        data["contact_pos"] = z["contact_pos"]
+                    if "q_wrap_guide" in z:
+                        data["q_wrap_guide"] = z["q_wrap_guide"]
+                    if not np.all(data["source"] == "reach_conditioned"):
+                        raise ValueError("unexpected source in arm-conditioned bank")
                 if not all(
                     np.isfinite(data[k]).all()
                     for k in ("q", "object_pose", "target_pos", "target_normal")
@@ -138,6 +252,22 @@ class LightningBank:
             .get("lightning_input_sha256", {})
             .get(self.side),
         )
+        conditioned = "arm_pre" in data
+        uniform = False
+        if conditioned:
+            low, high = np.quantile(surface.local[:, 2], [0.01, 0.99])
+            widths = []
+            for f in (0.32, 0.49, 0.72, 0.82):
+                section = surface.local[
+                    np.abs(surface.local[:, 2] - (low + f * (high - low))) < 0.006, :2
+                ]
+                if len(section) >= 10:
+                    widths.append(
+                        np.mean(
+                            np.diff(np.quantile(section, [0.01, 0.99], axis=0), axis=0)
+                        )
+                    )
+            uniform = len(widths) == 4 and min(widths) > 0.87 * max(widths)
         poses = reg @ np.linalg.inv(data["object_pose"])
         ids = data["contact_link_id"]
         present = ids >= 0
@@ -246,6 +376,14 @@ class LightningBank:
             # Keep opposed contacts and prefer the thumb above the other pads in
             # the score. A short low object may require knuckles directed down.
             eligible &= (poses[:, 2, 1] >= -0.25) & (pad_dz >= -0.014) & thumb.any(1)
+        elif conditioned:
+            # A cylinder can sit between the pads with the thumb near their
+            # mean height. Rank pad height within anatomically radial-up palms.
+            eligible &= (
+                (poses[:, 2, 1] >= 0.60)
+                & (poses[:, 2, 2] >= -0.50)
+                & (thumb.any(1) | ("q_wrap_guide" in data))
+            )
         else:
             eligible &= (
                 (poses[:, 2, 1] >= 0.25)
@@ -280,15 +418,83 @@ class LightningBank:
             close_palm = palm_gap <= 0.012
             tier[close_palm & (supported.sum(1) >= 4)] = 2
             tier[close_palm & supported.all(1)] = 3
+        if require_wrap and conditioned:
+            patch = central_palm_samples(ctrl.io.model.hand_support["right_hand_C_MC"])
+            seat_obj = np.linalg.inv(data["object_pose"]) @ data["tight_in_palm"]
+            points = (
+                patch @ seat_obj[:, :3, :3].transpose(0, 2, 1)
+                + seat_obj[:, None, :3, 3]
+            )
+            seated_gaps = np.quantile(surface.tree.query(points)[0], 0.15, axis=1)
+            pad_motion = np.zeros((len(poses), 5, 3))
+            if "q_wrap_guide" in data:
+                # Re-evaluate every finger on the registered surface at the final
+                # commanded seat, including fingers left free by the native solver.
+                if "seated_q" not in data:
+                    data["seated_q"] = data["q_wrap_guide"].copy()
+                for i in np.flatnonzero(eligible & (seated_gaps <= 0.005)):
+                    data["seated_q"][i] = fit_pressure_pose(
+                        ctrl,
+                        surface,
+                        seat_obj[i],
+                        data["q"][i],
+                        data["q_wrap_guide"][i],
+                        digits[i],
+                    )
+                    for j, digit in enumerate(
+                        ("thumb", "index", "middle", "ring", "pinky")
+                    ):
+                        near = False
+                        for suffix in ("elastomer", "PP" if digit == "thumb" else "MP"):
+                            link = f"right_{digit}_{suffix}"
+                            frame, _ = ctrl.hand_contacts.link(
+                                link, seat_obj[i], data["seated_q"][i]
+                            )
+                            cloud = (
+                                ctrl.io.model.hand_support[link] @ frame[:3, :3].T
+                                + frame[:3, 3]
+                            )
+                            if suffix == "elastomer":
+                                initial = np.linalg.solve(
+                                    data["object_pose"][i],
+                                    np.r_[data["pad_centers"][i, j], 1.0],
+                                )[:3]
+                                pad_motion[i, j] = cloud.mean(0) - initial
+                            if np.quantile(surface.tree.query(cloud)[0], 0.05) <= 0.006:
+                                near = True
+                                break
+                        supported[i, j] = near
+                tier[(seated_gaps <= 0.005) & supported.all(1)] = 3
         counts["nominal_full_wrap"] = int(np.count_nonzero(eligible & (tier == 3)))
         counts["full_wrap_required"] = require_wrap
         if require_wrap:
-            eligible &= (tier == 3) & (palm_gap <= 0.005)
-        counts["contact_geometry"] = int(eligible.sum())
+            if conditioned:
+                # The native start may stand away from the wall. Check the
+                # central patch again at the actual commanded seated transform.
+                eligible &= (tier == 3) & supported.all(1) & (seated_gaps <= 0.005)
+                score = (
+                    -1100 * data["cost"]
+                    - 0.25 * data["warm_delta_rad"]
+                    - 42 * data["standoff_m"]
+                    - 65 * np.linalg.norm(pad_motion[:, 0, :2], axis=1)
+                    - 95 * np.linalg.norm(pad_motion[:, :, :2].mean(axis=1), axis=1)
+                    - 20 * np.linalg.norm(pad_motion[:, :, :2], axis=2).mean(axis=1)
+                    + 8 * pad_dz
+                    + 0.43 * digits.sum(1)
+                    + 5.0 * uniform * digits.all(1)
+                )
+            else:
+                eligible &= (tier == 3) & (palm_gap <= 0.005)
         excluded = {int(s.split("-")[-1]) for s in previous if s.startswith("LG-")}
 
         def distinct(i):
             for j in excluded:
+                if (
+                    conditioned
+                    and i != j
+                    and np.linalg.norm(data["q"][i] - data["q"][j]) > 0.65
+                ):
+                    continue
                 if i == j or (
                     np.linalg.norm(poses[i, :3, 3] - poses[j, :3, 3]) < 0.018
                     and np.trace(poses[i, :3, :3].T @ poses[j, :3, :3]) > 2.55
@@ -302,8 +508,13 @@ class LightningBank:
         )
 
         def seating(i):
-            tight = data["q"][i].astype(float)
-            tight[flex] = np.clip(tight[flex] + 0.15, lo[flex], hi[flex])
+            tight = data.get("seated_q", data["q"])[i].astype(float)
+            tight[flex] = np.clip(
+                tight[flex] + (0.055 if conditioned else 0.15), lo[flex], hi[flex]
+            )
+            if conditioned:
+                goal = poses[i] @ data["tight_in_palm"][i]
+                return goal, tight, float(np.linalg.norm(goal[:3, 3] - poses[i, :3, 3]))
             depth = (
                 min(float(palm_gap[i]) + 0.0015, 0.005)
                 if power_body and palm_gap[i] <= 0.012
@@ -311,9 +522,19 @@ class LightningBank:
             )
             return shifted(poses[i], depth * poses[i, :3, 0]), tight, depth
 
+        direct_seat = conditioned and require_wrap and "seated_q" in data
+        if direct_seat and "seated_path" in data:
+            eligible &= data["seated_path"]
+
+        counts["contact_geometry"] = int(eligible.sum())
+        closure_mode = "lightning_grasp"
+        if conditioned:
+            closure_mode = "seated_wrap" if direct_seat else "power_wrap"
+
         choices = np.flatnonzero(eligible)
         order = choices[np.lexsort((-score[choices], -tier[choices]))]
         reached = []
+        reach_trace = {}
         approach_checks = np.zeros(4, dtype=int)
         for i in order:
             if reached and tier[i] < tier[reached[0][1]]:
@@ -324,7 +545,7 @@ class LightningBank:
             if (
                 np.any(q < lo - 0.002)
                 or np.any(q > hi + 0.002)
-                or not ctrl.clear(palm, q, others)
+                or (not direct_seat and not ctrl.clear(palm, q, others))
                 or (fixture and not surface.clear(fixture, palm, 0.001))
             ):
                 continue
@@ -338,6 +559,8 @@ class LightningBank:
             open_q[flex] = ctrl.open_hand[flex] + 0.23 * (
                 q[flex] - ctrl.open_hand[flex]
             )
+            if conditioned:
+                open_q = data["q_open"][i]
             geometry = ctrl.link_shapes(open_q)
             toward_out = -palm[:3, 0]
             pre_options = [
@@ -348,6 +571,8 @@ class LightningBank:
                     (0.045, 0.040, 0.028),
                 )
             ]
+            if conditioned:
+                pre_options = [palm @ data["pre_in_palm"][i]]
             pre_options = [
                 p
                 for p in pre_options
@@ -366,6 +591,8 @@ class LightningBank:
             if not pre_options:
                 continue
             counts["open_approach"] += 1
+            failures = {}
+            reach_trace[int(i)] = {"open_poses": len(pre_options), "branches": failures}
             approach_checks[tier[i]] += 1
             for pre in pre_options:
                 solved = None
@@ -378,17 +605,44 @@ class LightningBank:
                         atlas[:, :3, 3] - pre[:3, 3], axis=1
                     ) + 0.10 * (3 - dot)
                     ik_seeds.extend(ctrl.bank.q[np.argsort(cost)[:4]])
+                if conditioned:
+                    ik_seeds.insert(0, data["arm_pre"][i])
                 for seed in ik_seeds:
+                    stage = "pregrasp_ik"
                     try:
                         solved = ctrl.ik.solve(pre, seed)
+                        stage = "closure_path"
                         if require_wrap or getattr(ctrl, "adaptive", False):
                             ctrl.check_closure_path(
-                                "lightning_grasp", solved, palm, closure_goal
+                                closure_mode,
+                                solved,
+                                palm,
+                                closure_goal,
                             )
                         else:
                             ctrl.lightning_lift_ik(palm, solved)
                         break
-                    except NoPath:
+                    except NoPath as error:
+                        reason = getattr(
+                            error,
+                            "stage",
+                            stage if str(error) == "arm IK" else str(error),
+                        )
+                        entry = failures.setdefault(reason, {"count": 0})
+                        entry["count"] += 1
+                        if hasattr(error, "residual"):
+                            pos, angle = error.residual
+                            if (
+                                "closest_position_m" not in entry
+                                or pos < entry["closest_position_m"]
+                            ):
+                                entry.update(
+                                    closest_position_m=pos,
+                                    rotation_at_closest_rad=angle,
+                                    bound_joint_numbers=[
+                                        j + 1 for j in error.bound_joints
+                                    ],
+                                )
                         solved = None
                 if solved is not None:
                     counts["arm_reachable"] += 1
@@ -397,7 +651,7 @@ class LightningBank:
                     break
             if len(reached) >= 6:
                 break
-        ctrl.event("lightning_filter", **counts)
+        ctrl.event("lightning_filter", **counts, reach_by_bank_row=reach_trace)
         if not reached:
             if require_wrap:
                 raise NoPath(
@@ -419,6 +673,10 @@ class LightningBank:
             "candidate_source": str(data["source"][i]),
             "source_id": int(data["source_id"][i]),
         }
+        if "source_domain_sha256" in data:
+            identity["domain_sha256"] = str(data["source_domain_sha256"][i])
+        else:
+            identity["domain_sha256"] = receipt.get("request_sha256")
         ctrl.event(
             "selected",
             origin="lightning_grasp",
@@ -432,12 +690,21 @@ class LightningBank:
             ],
             thumb_above_mean_fingers_m=float(thumb_dz[i]) if thumb[i].any() else None,
             predicted_thumb_pad_above_four_m=float(pad_dz[i]),
+            explicitly_constrained_fingers=digits[i].tolist(),
             radial_axis_world_z=float(palm[2, 1]),
             wrist_to_knuckles_world_z=float(palm[2, 2]),
             turn_from_park_deg=float(np.rad2deg(turn[i])),
             central_palm_gap_m=float(palm_gap[i]),
+            seated_central_palm_gap_m=float(seated_gaps[i])
+            if require_wrap and conditioned
+            else None,
             full_wrap_required=require_wrap,
             palm_seat_m=seat_depth,
+            native_five_on_uniform_shaft=bool(uniform and digits[i].all()),
+            closure_mode=closure_mode,
+            pad_travel_to_seat_m=np.linalg.norm(pad_motion[i], axis=1).tolist()
+            if require_wrap and conditioned
+            else None,
             contact_tier=("multi_digit", "palm_and_three", "palm_and_four")[
                 tier[i] - 1
             ],
@@ -445,15 +712,33 @@ class LightningBank:
             rgbd_object_pose=reg.tolist(),
             palm_grasp=palm.tolist(),
             native_q=q.tolist(),
+            seated_q=data["seated_q"][i].tolist() if "seated_q" in data else None,
             hand_model="sharpa_22",
             bank_side=self.side,
             bank_input_sha256=receipt["input_sha256"],
         )
+        knots = []
+        if conditioned and "seated_q" in data and "contact_pos" in data:
+            knots = seat_contact_knots(
+                ctrl,
+                palm,
+                seated,
+                q,
+                data["seated_q"][i],
+                links[i, present[i]],
+                data["contact_pos"][i, present[i]],
+                data["target_pos"][i, present[i]],
+            )
         return dict(
+            seating_knots=knots,
+            explicit_digits=digits[i].tolist(),
+            closure_mode=closure_mode,
             posture=posture,
             origin="lightning_grasp",
             lightning_candidate=identity,
+            power_wrap=conditioned,
             q_open=open_q,
             q_touch=q,
             q_tight=tight,
+            seated_q=data["seated_q"][i] if "seated_q" in data else None,
         ), dict(pre=pre, grasp=palm, tight=seated)
